@@ -3,6 +3,9 @@
 //! The window lives in [`app`]; all conversion logic comes from the `iso2god_next`
 //! crate, and background work is isolated in [`task`].
 
+// Don't open a console window next to the app on Windows.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod format;
 mod ftp;

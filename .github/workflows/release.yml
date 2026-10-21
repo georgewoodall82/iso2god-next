@@ -14,82 +14,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  APP_ID: io.github.georgewoodall82.Iso2godNext
+
+# Every job builds the desktop app and attaches one file named
+# iso2god-next-<version>-<platform>-<arch>.<ext> to the release. Pushes to a
+# ci-* branch run the same jobs and only produce a draft release.
 
 jobs:
-  publish-to-github:
-    name: Build CLI
-    runs-on: ${{matrix.runner}}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            rust: 1.85.1
-            target: x86_64-unknown-linux-gnu
-            build_filename: iso2god-next
-            release_filename: iso2god-next-x86_64-linux
-
-          - runner: ubuntu-24.04-arm
-            rust: 1.85.1
-            target: aarch64-unknown-linux-gnu
-            build_filename: iso2god-next
-            release_filename: iso2god-next-aarch64-linux
-
-          - runner: macos-15-intel
-            rust: 1.85.1
-            target: x86_64-apple-darwin
-            build_filename: iso2god-next
-            release_filename: iso2god-next-x86_64-macos
-
-          - runner: macos-latest
-            rust: 1.85.1
-            target: aarch64-apple-darwin
-            build_filename: iso2god-next
-            release_filename: iso2god-next-aarch64-macos
-
-          - runner: windows-latest
-            rust: 1.85.1
-            target: x86_64-pc-windows-gnu
-            build_filename: iso2god-next.exe
-            release_filename: iso2god-next-x86_64-windows.exe
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.rustup
-            target
-          key: ${{ matrix.rust }}-${{ matrix.target }}
-
-      - name: Install Rust
-        run: |
-          rustup default ${{ matrix.rust }}
-          rustup target add ${{ matrix.target }}
-          rustup show
-
-      - name: Build
-        run: |
-          cargo build --release --target ${{ matrix.target }} --bin iso2god-next
-          mkdir -p ./out
-          mv ./target/${{ matrix.target }}/release/${{ matrix.build_filename }} out/${{ matrix.release_filename }}
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ github.ref_name }}
-          draft: ${{ github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
-          files: out/*
-          fail_on_unmatched_files: false
-
-  publish-appimage:
-    name: Build GUI AppImage (${{matrix.arch}})
+  linux:
+    name: Linux AppImage (${{matrix.arch}})
     # The GUI needs libadwaita 1.5+, which first shipped in Ubuntu 24.04, so
     # the AppImage runs on distributions with glibc 2.39 or newer.
     runs-on: ${{matrix.runner}}
@@ -108,7 +41,6 @@ jobs:
             linuxdeploy_sha256: 620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff
 
     env:
-      APP_ID: io.github.georgewoodall82.Iso2godNext
       LINUXDEPLOY_VERSION: 1-alpha-20251107-1
       LINUXDEPLOY_APPIMAGE_PLUGIN_VERSION: 1-alpha-20250213-1
       LINUXDEPLOY_GTK_PLUGIN_COMMIT: 7a3fbc31a9e5075073ff8790f26effbac5f84453
@@ -116,6 +48,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Work out the version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="dev-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -186,7 +123,208 @@ jobs:
           ! grep -q '^export GTK_THEME=' "$hook"
 
           linuxdeploy-${ARCH}.AppImage --appdir AppDir --output appimage
-          mv ./*.AppImage ../out/iso2god-next-gui-${ARCH}.AppImage
+          mv ./*.AppImage ../out/iso2god-next-${VERSION}-linux-${ARCH}.AppImage
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: ${{ github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
+          files: out/*
+          fail_on_unmatched_files: false
+
+  windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Work out the version
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="dev-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # GTK4 and libadwaita come from MSYS2, so the app is built with the
+      # MinGW toolchain from the same environment.
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            zip
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-rust
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gtk4
+            mingw-w64-x86_64-libadwaita
+            mingw-w64-x86_64-librsvg
+            mingw-w64-x86_64-adwaita-icon-theme
+
+      - name: Build
+        run: cargo build --release --locked -p iso2god-next-gui
+
+      # A flat folder: GLib finds share/ and lib/ next to the executable.
+      - name: Bundle
+        run: |
+          dist="iso2god-next-${VERSION}-windows-x86_64"
+          mkdir -p "$dist/lib" "$dist/share/glib-2.0" "$dist/share/icons/hicolor/scalable/apps" out
+
+          cp target/release/iso2god-next-gui.exe "$dist/"
+
+          # gdk-pixbuf image loaders (SVG icons need the librsvg one)
+          cp -r /mingw64/lib/gdk-pixbuf-2.0 "$dist/lib/"
+
+          # every MinGW DLL that the executable and the loaders need
+          roots=("$dist/iso2god-next-gui.exe")
+          while IFS= read -r -d '' dll; do roots+=("$dll"); done \
+            < <(find "$dist/lib/gdk-pixbuf-2.0" -name '*.dll' -print0)
+          for root in "${roots[@]}"; do
+            ldd "$root" | awk '/\/mingw64\//{print $3}'
+          done | sort -u | while read -r dll; do cp "$dll" "$dist/"; done
+
+          cp -r /mingw64/share/glib-2.0/schemas "$dist/share/glib-2.0/"
+          cp -r /mingw64/share/icons/Adwaita "$dist/share/icons/"
+          cp -r /mingw64/share/icons/hicolor "$dist/share/icons/" || true
+          cp "gui/data/${APP_ID}.svg" "$dist/share/icons/hicolor/scalable/apps/"
+          cp LICENSE "$dist/"
+
+          zip -qr "out/$dist.zip" "$dist"
+          ls -l out
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: ${{ github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
+          files: out/*
+          fail_on_unmatched_files: false
+
+  macos:
+    name: macOS (${{matrix.arch}})
+    runs-on: ${{matrix.runner}}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: aarch64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Work out the version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="dev-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: brew install gtk4 libadwaita librsvg adwaita-icon-theme dylibbundler pkgconf
+
+      - name: Install Rust
+        run: |
+          rustup default stable
+          rustup show
+
+      - name: Build
+        run: cargo build --release --locked -p iso2god-next-gui
+
+      # A self-contained .app: libraries are copied into Frameworks and the
+      # launcher points GTK at the bundled schemas, icons and image loaders.
+      - name: Bundle
+        run: |
+          prefix="$(brew --prefix)"
+          app="out/ISO2GOD Next.app"
+          contents="$app/Contents"
+          res="$PWD/$contents/Resources"
+          mkdir -p "$contents/MacOS" "$contents/Frameworks" "$res/share/glib-2.0" "$res/share/icons/hicolor/scalable/apps" "$res/lib" out
+
+          cp target/release/iso2god-next-gui "$contents/MacOS/iso2god-next-gui-bin"
+
+          # gdk-pixbuf loaders, with a cache whose paths are filled in at launch
+          loaders="$res/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+          mkdir -p "$loaders"
+          cp "$prefix"/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so "$loaders/"
+          GDK_PIXBUF_MODULEDIR="$loaders" "$prefix/bin/gdk-pixbuf-query-loaders" \
+            | sed "s|$res|@RES@|g" > "$res/lib/gdk-pixbuf-2.0/loaders.cache.in"
+          grep -q '@RES@' "$res/lib/gdk-pixbuf-2.0/loaders.cache.in"
+
+          # copy the dylibs the executable and the loaders depend on
+          args=(-x "$contents/MacOS/iso2god-next-gui-bin")
+          for loader in "$loaders"/*.so; do args+=(-x "$loader"); done
+          dylibbundler -od -b "${args[@]}" -d "$contents/Frameworks" -p '@executable_path/../Frameworks/'
+
+          # schemas and icons
+          mkdir -p "$res/share/glib-2.0/schemas"
+          cp "$prefix"/share/glib-2.0/schemas/*.xml "$res/share/glib-2.0/schemas/"
+          cp "$prefix"/share/glib-2.0/schemas/*.override "$res/share/glib-2.0/schemas/" 2>/dev/null || true
+          "$prefix/bin/glib-compile-schemas" "$res/share/glib-2.0/schemas"
+          cp -R "$prefix/share/icons/Adwaita" "$res/share/icons/"
+          cp -R "$prefix/share/icons/hicolor/." "$res/share/icons/hicolor/" || true
+          cp "gui/data/${APP_ID}.svg" "$res/share/icons/hicolor/scalable/apps/"
+
+          # application icon
+          iconset="$RUNNER_TEMP/AppIcon.iconset"
+          mkdir -p "$iconset"
+          for size in 16 32 64 128 256 512; do
+            "$prefix/bin/rsvg-convert" -w $size -h $size "gui/data/${APP_ID}.svg" -o "$iconset/icon_${size}x${size}.png"
+          done
+          for size in 16 32 128 256; do
+            double=$((size * 2))
+            cp "$iconset/icon_${double}x${double}.png" "$iconset/icon_${size}x${size}@2x.png"
+          done
+          rm "$iconset/icon_64x64.png"
+          iconutil -c icns "$iconset" -o "$res/AppIcon.icns"
+
+          cat > "$contents/MacOS/iso2god-next-gui" <<'LAUNCHER'
+          #!/bin/bash
+          here="$(cd "$(dirname "$0")" && pwd)"
+          res="$here/../Resources"
+          export XDG_DATA_DIRS="$res/share:/usr/local/share:/usr/share"
+          export GSETTINGS_SCHEMA_DIR="$res/share/glib-2.0/schemas"
+          cache="${TMPDIR:-/tmp}/iso2god-next-pixbuf-loaders.cache"
+          sed "s|@RES@|$res|g" "$res/lib/gdk-pixbuf-2.0/loaders.cache.in" > "$cache"
+          export GDK_PIXBUF_MODULE_FILE="$cache"
+          exec "$here/iso2god-next-gui-bin" "$@"
+          LAUNCHER
+          chmod +x "$contents/MacOS/iso2god-next-gui"
+
+          cat > "$contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>ISO2GOD Next</string>
+            <key>CFBundleDisplayName</key><string>ISO2GOD Next</string>
+            <key>CFBundleIdentifier</key><string>${APP_ID}</string>
+            <key>CFBundleExecutable</key><string>iso2god-next-gui</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
+            <key>CFBundleVersion</key><string>${VERSION#v}</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Unsigned code does not run on Apple silicon; an ad-hoc signature does.
+          codesign --force --deep --sign - "$app"
+
+          hdiutil create -volname "ISO2GOD Next" -srcfolder "$app" -ov -format UDZO \
+            "out/iso2god-next-${VERSION}-macos-${{ matrix.arch }}.dmg"
+          rm -rf "$app"
+          ls -l out
 
       - name: Release
         uses: softprops/action-gh-release@v2

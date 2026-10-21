@@ -6,7 +6,11 @@ on:
       - v*
     branches:
       - ci-*
-      - master
+
+# Needed to create the release and upload assets, regardless of the
+# repository's default token permissions (forks default to read-only).
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always

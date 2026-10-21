@@ -1,7 +1,7 @@
 use anyhow::{Context, Error};
 use clap::{Parser, command};
 
-use iso2god::game_list;
+use iso2god_next::game_list;
 
 mod unity;
 

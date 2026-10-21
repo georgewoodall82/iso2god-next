@@ -22,32 +22,32 @@ jobs:
           - runner: ubuntu-latest
             rust: 1.85.1
             target: x86_64-unknown-linux-gnu
-            build_filename: iso2god
-            release_filename: iso2god-x86_64-linux
+            build_filename: iso2god-next
+            release_filename: iso2god-next-x86_64-linux
 
           - runner: ubuntu-24.04-arm
             rust: 1.85.1
             target: aarch64-unknown-linux-gnu
-            build_filename: iso2god
-            release_filename: iso2god-aarch64-linux
+            build_filename: iso2god-next
+            release_filename: iso2god-next-aarch64-linux
 
           - runner: macos-13
             rust: 1.85.1
             target: x86_64-apple-darwin
-            build_filename: iso2god
-            release_filename: iso2god-x86_64-macos
+            build_filename: iso2god-next
+            release_filename: iso2god-next-x86_64-macos
 
           - runner: macos-latest
             rust: 1.85.1
             target: aarch64-apple-darwin
-            build_filename: iso2god
-            release_filename: iso2god-aarch64-macos
+            build_filename: iso2god-next
+            release_filename: iso2god-next-aarch64-macos
 
           - runner: windows-latest
             rust: 1.85.1
             target: x86_64-pc-windows-gnu
-            build_filename: iso2god.exe
-            release_filename: iso2god-x86_64-windows.exe
+            build_filename: iso2god-next.exe
+            release_filename: iso2god-next-x86_64-windows.exe
 
     steps:
       - name: Checkout repository
@@ -71,7 +71,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin iso2god
+          cargo build --release --target ${{ matrix.target }} --bin iso2god-next
           mkdir -p ./out
           mv ./target/${{ matrix.target }}/release/${{ matrix.build_filename }} out/${{ matrix.release_filename }}
 

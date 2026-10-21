@@ -10,10 +10,20 @@ pub struct ConHeaderBuilder {
     buffer: Vec<u8>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContentType {
     GamesOnDemand = 0x7000,
     XboxOriginal = 0x5000,
+}
+
+impl ContentType {
+    /// Human-readable name for frontends.
+    pub fn description(self) -> &'static str {
+        match self {
+            ContentType::GamesOnDemand => "Xbox 360",
+            ContentType::XboxOriginal => "Xbox Original",
+        }
+    }
 }
 
 impl Default for ConHeaderBuilder {

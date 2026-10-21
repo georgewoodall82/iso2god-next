@@ -42,10 +42,22 @@ impl<'a> FileLayout<'a> {
         }
     }
 
-    pub fn data_dir_path(&self) -> PathBuf {
+    /// Folder that holds everything belonging to one converted title, i.e.
+    /// `<base>/<TitleID>/<ContentType>`. Frontends copy this folder to the
+    /// console's content directory.
+    pub fn package_dir_path(&self) -> PathBuf {
         self.base_path
             .join(self.title_id_string())
             .join(self.content_type_string())
+    }
+
+    /// [`Self::package_dir_path`] relative to the base path.
+    pub fn package_relative_path(&self) -> PathBuf {
+        PathBuf::from(self.title_id_string()).join(self.content_type_string())
+    }
+
+    pub fn data_dir_path(&self) -> PathBuf {
+        self.package_dir_path()
             .join(self.media_id_string() + ".data")
     }
 
@@ -54,9 +66,6 @@ impl<'a> FileLayout<'a> {
     }
 
     pub fn con_header_file_path(&self) -> PathBuf {
-        self.base_path
-            .join(self.title_id_string())
-            .join(self.content_type_string())
-            .join(self.media_id_string())
+        self.package_dir_path().join(self.media_id_string())
     }
 }

@@ -5,7 +5,7 @@ use anyhow::{Context, Error};
 
 use clap::{Parser, command};
 
-use iso2god::iso;
+use iso2god_next::iso;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]

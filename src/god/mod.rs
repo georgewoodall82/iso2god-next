@@ -2,6 +2,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::Error;
 
+use crate::convert::Cancelled;
+
 mod con_header;
 pub use con_header::*;
 
@@ -21,10 +23,28 @@ pub const SUBPARTS_PER_PART: u32 = 0xcb;
 pub const SUBPART_SIZE: u64 = BLOCK_SIZE * BLOCKS_PER_SUBPART;
 
 pub fn write_part<R: Read + Seek, W: Write + Seek>(
+    data_volume: R,
+    part_index: u64,
+    part_file: W,
+) -> Result<(), Error> {
+    write_part_observed(data_volume, part_index, part_file, |_| {}, || false)
+}
+
+/// Writes one part file, reporting copied bytes through `on_bytes` and checking
+/// `cancelled` between subparts so long conversions can be stopped promptly.
+pub fn write_part_observed<R, W, P, C>(
     mut data_volume: R,
     part_index: u64,
     mut part_file: W,
-) -> Result<(), Error> {
+    mut on_bytes: P,
+    mut cancelled: C,
+) -> Result<(), Error>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+    P: FnMut(u64),
+    C: FnMut() -> bool,
+{
     data_volume.seek_relative((part_index * BLOCKS_PER_PART * BLOCK_SIZE) as i64)?;
 
     let mut master_hash_list = HashList::new();
@@ -35,6 +55,10 @@ pub fn write_part<R: Read + Seek, W: Write + Seek>(
     let mut subpart_buf = Vec::with_capacity(SUBPART_SIZE as usize);
 
     for _subpart_index in 0..SUBPARTS_PER_PART {
+        if cancelled() {
+            return Err(Cancelled.into());
+        }
+
         data_volume
             .by_ref()
             .take(SUBPART_SIZE)
@@ -57,6 +81,7 @@ pub fn write_part<R: Read + Seek, W: Write + Seek>(
         // https://doc.rust-lang.org/std/io/fn.copy.html#platform-specific-behavior
         data_volume.seek_relative(0 - subpart_buf.len() as i64)?;
         std::io::copy(&mut data_volume.by_ref().take(SUBPART_SIZE), &mut part_file)?;
+        on_bytes(subpart_buf.len() as u64);
 
         if subpart_buf.len() < SUBPART_SIZE as usize {
             break;

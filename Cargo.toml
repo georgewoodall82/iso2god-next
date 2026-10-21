@@ -1,9 +1,16 @@
 [package]
-name = "iso2god"
+name = "iso2god-next"
 version = "1.8.0"
-description = "A tool to convert between Xbox 360 ISO and Games On Demand file formats"
-repository = "https://github.com/iliazeus/iso2god-rs"
+description = "Convert Xbox 360 and original Xbox ISOs to Games on Demand packages, with a GTK GUI and FTP upload"
+repository = "https://github.com/georgewoodall82/iso2god-next"
 edition = "2024"
+
+[workspace]
+members = [".", "gui"]
+# Keep `cargo build` and the release workflow building just the CLI; the GUI is
+# built explicitly with `cargo build -p iso2god-next-gui`.
+default-members = ["."]
+resolver = "3"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

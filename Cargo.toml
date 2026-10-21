@@ -1,6 +1,6 @@
 [package]
 name = "iso2god-next"
-version = "1.8.0"
+version = "1.0.0"
 description = "Convert Xbox 360 and original Xbox ISOs to Games on Demand packages, with a GTK GUI and FTP upload"
 repository = "https://github.com/georgewoodall82/iso2god-next"
 edition = "2024"

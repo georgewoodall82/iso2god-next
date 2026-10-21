@@ -13,10 +13,11 @@ env:
 
 jobs:
   publish-to-github:
-    name: Build
+    name: Build CLI
     runs-on: ${{matrix.runner}}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
@@ -31,7 +32,7 @@ jobs:
             build_filename: iso2god-next
             release_filename: iso2god-next-aarch64-linux
 
-          - runner: macos-13
+          - runner: macos-15-intel
             rust: 1.85.1
             target: x86_64-apple-darwin
             build_filename: iso2god-next
@@ -74,6 +75,105 @@ jobs:
           cargo build --release --target ${{ matrix.target }} --bin iso2god-next
           mkdir -p ./out
           mv ./target/${{ matrix.target }}/release/${{ matrix.build_filename }} out/${{ matrix.release_filename }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: ${{ github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
+          files: out/*
+          fail_on_unmatched_files: false
+
+  publish-appimage:
+    name: Build GUI AppImage (${{matrix.arch}})
+    # The GUI needs libadwaita 1.5+, which first shipped in Ubuntu 24.04, so
+    # the AppImage runs on distributions with glibc 2.39 or newer.
+    runs-on: ${{matrix.runner}}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            # sha256 of linuxdeploy-x86_64.AppImage in the pinned release
+            linuxdeploy_sha256: c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            linuxdeploy_sha256: 620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff
+
+    env:
+      APP_ID: io.github.georgewoodall82.Iso2godNext
+      LINUXDEPLOY_VERSION: 1-alpha-20251107-1
+      LINUXDEPLOY_APPIMAGE_PLUGIN_VERSION: 1-alpha-20250213-1
+      LINUXDEPLOY_GTK_PLUGIN_COMMIT: 7a3fbc31a9e5075073ff8790f26effbac5f84453
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev librsvg2-common \
+            adwaita-icon-theme gsettings-desktop-schemas \
+            desktop-file-utils file
+
+      - name: Install Rust
+        run: |
+          rustup default stable
+          rustup show
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: appimage-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked -p iso2god-next-gui
+
+      - name: Download AppImage tooling
+        run: |
+          mkdir -p "$HOME/tools"
+          cd "$HOME/tools"
+
+          curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-${{ matrix.arch }}.AppImage"
+          echo "${{ matrix.linuxdeploy_sha256 }}  linuxdeploy-${{ matrix.arch }}.AppImage" | sha256sum -c -
+
+          curl -fsSL -o linuxdeploy-plugin-appimage \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/${LINUXDEPLOY_APPIMAGE_PLUGIN_VERSION}/linuxdeploy-plugin-appimage-${{ matrix.arch }}.AppImage"
+          curl -fsSL -o linuxdeploy-plugin-gtk.sh \
+            "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/${LINUXDEPLOY_GTK_PLUGIN_COMMIT}/linuxdeploy-plugin-gtk.sh"
+
+          chmod +x linuxdeploy-*
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+
+      - name: Validate desktop entry
+        run: desktop-file-validate gui/data/${APP_ID}.desktop
+
+      - name: Package AppImage
+        env:
+          ARCH: ${{ matrix.arch }}
+          DEPLOY_GTK_VERSION: "4"
+          # the tools are AppImages themselves; run them without FUSE
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          mkdir -p appimage-build out
+          cd appimage-build
+          linuxdeploy-${ARCH}.AppImage \
+            --appdir AppDir \
+            --executable ../target/release/iso2god-next-gui \
+            --desktop-file ../gui/data/${APP_ID}.desktop \
+            --icon-file ../gui/data/${APP_ID}.svg \
+            --plugin gtk \
+            --output appimage
+          mv ./*.AppImage ../out/iso2god-next-gui-${ARCH}.AppImage
 
       - name: Release
         uses: softprops/action-gh-release@v2

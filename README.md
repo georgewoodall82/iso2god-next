@@ -19,6 +19,24 @@
 - **Title lookup**: the game name is filled in automatically from the built-in title database, or you can set your own.
 - Handles both Xbox 360 and original Xbox images.
 
+## Download
+
+Grab the latest build from the [releases page](https://github.com/georgewoodall82/iso2god-next/releases).
+
+| What | File |
+| ---- | ---- |
+| Desktop app for Linux | `iso2god-next-gui-x86_64.AppImage` or `iso2god-next-gui-aarch64.AppImage` |
+| Command line tool | `iso2god-next-<arch>-linux`, `-macos` or `-windows.exe` |
+
+To run the AppImage, make it executable and start it:
+
+```sh
+chmod +x iso2god-next-gui-x86_64.AppImage
+./iso2god-next-gui-x86_64.AppImage
+```
+
+The AppImage is built on Ubuntu 24.04, so it needs a distribution with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 and later). The desktop app is Linux-only for now; on other systems use the command line tool.
+
 ## Desktop app
 
 1. **Add ISOs** with the button, by dragging files into the window, or on the command line.
@@ -64,7 +82,7 @@ iso2god-next-gui [-o|--output DIR] [ISO_FILE ...]
 
 ## Command line
 
-The CLI has no GUI dependencies. Prebuilt binaries for Linux, macOS and Windows are attached to the [releases](https://github.com/georgewoodall82/iso2god-next/releases), or build it yourself:
+The CLI has no GUI dependencies. Prebuilt binaries are on the releases page (see [Download](#download)), or build it yourself:
 
 ```sh
 cargo build --release

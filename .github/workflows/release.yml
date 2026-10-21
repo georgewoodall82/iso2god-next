@@ -175,8 +175,17 @@ jobs:
             --executable ../target/release/iso2god-next-gui \
             --desktop-file ../gui/data/${APP_ID}.desktop \
             --icon-file ../gui/data/${APP_ID}.svg \
-            --plugin gtk \
-            --output appimage
+            --plugin gtk
+
+          # The GTK plugin forces GTK_THEME for GTK3 apps. libadwaita does not
+          # support it: it drops its own stylesheet, which leaves old-style
+          # buttons and dialogs without a background.
+          hook=AppDir/apprun-hooks/linuxdeploy-plugin-gtk.sh
+          test -f "$hook"
+          sed -i '/^export GTK_THEME=/d' "$hook"
+          ! grep -q '^export GTK_THEME=' "$hook"
+
+          linuxdeploy-${ARCH}.AppImage --appdir AppDir --output appimage
           mv ./*.AppImage ../out/iso2god-next-gui-${ARCH}.AppImage
 
       - name: Release

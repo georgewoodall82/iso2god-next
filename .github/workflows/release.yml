@@ -25,6 +25,7 @@ jobs:
     name: Linux AppImage (${{matrix.arch}})
     # The GUI needs libadwaita 1.5+, which first shipped in Ubuntu 24.04, so
     # the AppImage runs on distributions with glibc 2.39 or newer.
+    timeout-minutes: 30
     runs-on: ${{matrix.runner}}
 
     strategy:
@@ -135,6 +136,7 @@ jobs:
 
   windows:
     name: Windows (x86_64)
+    timeout-minutes: 30
     runs-on: windows-latest
 
     defaults:
@@ -151,22 +153,22 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="dev-${GITHUB_SHA::7}"; fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
-      # GTK4 and libadwaita come from MSYS2, so the app is built with the
-      # MinGW toolchain from the same environment.
+      # GTK4 and libadwaita come from MSYS2's UCRT64 environment, so the app is
+      # built with the toolchain from the same environment.
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             zip
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-rust
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-gtk4
-            mingw-w64-x86_64-libadwaita
-            mingw-w64-x86_64-librsvg
-            mingw-w64-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
 
       - name: Build
         run: cargo build --release --locked -p iso2god-next-gui
@@ -180,19 +182,19 @@ jobs:
           cp target/release/iso2god-next-gui.exe "$dist/"
 
           # gdk-pixbuf image loaders (SVG icons need the librsvg one)
-          cp -r /mingw64/lib/gdk-pixbuf-2.0 "$dist/lib/"
+          cp -r /ucrt64/lib/gdk-pixbuf-2.0 "$dist/lib/"
 
-          # every MinGW DLL that the executable and the loaders need
+          # every UCRT64 DLL that the executable and the loaders need
           roots=("$dist/iso2god-next-gui.exe")
           while IFS= read -r -d '' dll; do roots+=("$dll"); done \
             < <(find "$dist/lib/gdk-pixbuf-2.0" -name '*.dll' -print0)
           for root in "${roots[@]}"; do
-            ldd "$root" | awk '/\/mingw64\//{print $3}'
+            ldd "$root" | awk '/\/ucrt64\//{print $3}'
           done | sort -u | while read -r dll; do cp "$dll" "$dist/"; done
 
-          cp -r /mingw64/share/glib-2.0/schemas "$dist/share/glib-2.0/"
-          cp -r /mingw64/share/icons/Adwaita "$dist/share/icons/"
-          cp -r /mingw64/share/icons/hicolor "$dist/share/icons/" || true
+          cp -r /ucrt64/share/glib-2.0/schemas "$dist/share/glib-2.0/"
+          cp -r /ucrt64/share/icons/Adwaita "$dist/share/icons/"
+          cp -r /ucrt64/share/icons/hicolor "$dist/share/icons/" || true
           cp "gui/data/${APP_ID}.svg" "$dist/share/icons/hicolor/scalable/apps/"
           cp LICENSE "$dist/"
 
@@ -209,6 +211,7 @@ jobs:
 
   macos:
     name: macOS (${{matrix.arch}})
+    timeout-minutes: 30
     runs-on: ${{matrix.runner}}
 
     strategy:
@@ -263,7 +266,12 @@ jobs:
           # copy the dylibs the executable and the loaders depend on
           args=(-x "$contents/MacOS/iso2god-next-gui-bin")
           for loader in "$loaders"/*.so; do args+=(-x "$loader"); done
-          dylibbundler -od -b "${args[@]}" -d "$contents/Frameworks" -p '@executable_path/../Frameworks/'
+          # Search every Homebrew library folder; when a library is missing
+          # dylibbundler asks for a path on stdin and loops forever, so give it
+          # a deadline and no stdin.
+          for dir in "$prefix/lib" "$prefix"/opt/*/lib; do args+=(-s "$dir"); done
+          perl -e 'alarm shift; exec @ARGV' 300 \
+            dylibbundler -od -b "${args[@]}" -d "$contents/Frameworks" -p '@executable_path/../Frameworks/' </dev/null
 
           # schemas and icons
           mkdir -p "$res/share/glib-2.0/schemas"

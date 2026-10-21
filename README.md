@@ -21,21 +21,38 @@
 
 ## Download
 
-Grab the latest build from the [releases page](https://github.com/georgewoodall82/iso2god-next/releases).
+Grab the latest build from the [releases page](https://github.com/georgewoodall82/iso2god-next/releases). File names include the version, shown here as `<version>` (for example `v1.0.1`).
 
-| What | File |
-| ---- | ---- |
-| Desktop app for Linux | `iso2god-next-gui-x86_64.AppImage` or `iso2god-next-gui-aarch64.AppImage` |
-| Command line tool | `iso2god-next-<arch>-linux`, `-macos` or `-windows.exe` |
+| Platform | File | Status |
+| -------- | ---- | ------ |
+| Linux (x86_64) | `iso2god-next-<version>-linux-x86_64.AppImage` | Supported |
+| Linux (aarch64) | `iso2god-next-<version>-linux-aarch64.AppImage` | Supported |
+| Windows (x86_64) | `iso2god-next-<version>-windows-x86_64.zip` | **Experimental** |
+| macOS (Apple silicon) | `iso2god-next-<version>-macos-aarch64.dmg` | **Experimental** |
+| macOS (Intel) | `iso2god-next-<version>-macos-x86_64.dmg` | **Experimental** |
 
-To run the AppImage, make it executable and start it:
+### Linux
+
+Make the AppImage executable and start it:
 
 ```sh
-chmod +x iso2god-next-gui-x86_64.AppImage
-./iso2god-next-gui-x86_64.AppImage
+chmod +x iso2god-next-*-linux-x86_64.AppImage
+./iso2god-next-*-linux-x86_64.AppImage
 ```
 
-The AppImage is built on Ubuntu 24.04, so it needs a distribution with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 and later). The desktop app is Linux-only for now; on other systems use the command line tool.
+The AppImage is built on Ubuntu 24.04, so it needs a distribution with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13 and later).
+
+### Windows (experimental)
+
+Unzip the archive anywhere and run `iso2god-next-gui.exe`. The program is not code-signed, so Windows SmartScreen may warn you the first time: choose **More info → Run anyway**.
+
+### macOS (experimental)
+
+Open the disk image and drag **ISO2GOD Next** into Applications. The app is only ad-hoc signed, so macOS refuses to open it by double-clicking the first time: right-click it, choose **Open**, then confirm.
+
+The Windows and macOS builds are produced automatically but have had little testing on real machines. If the window does not open or looks wrong, please [open an issue](https://github.com/georgewoodall82/iso2god-next/issues) with your system version and any error text.
+
+The command line tool is not part of the releases; build it from source (see [Command line](#command-line)).
 
 ## Desktop app
 
@@ -52,7 +69,7 @@ The AppImage is built on Ubuntu 24.04, so it needs a distribution with glibc 2.3
 | <kbd>Ctrl</kbd>+<kbd>,</kbd> | Settings |
 | <kbd>F1</kbd> | About |
 
-FTP settings are saved to `~/.config/iso2god-next/ftp.json` (or under `$XDG_CONFIG_HOME`). The password is stored in plain text, and the file is created readable only by you.
+FTP settings are saved to `iso2god-next/ftp.json` in your user configuration folder (`~/.config` on Linux and macOS, `%APPDATA%` on Windows). The password is stored in plain text. On Linux and macOS the file is created readable only by you.
 
 ### Building the app
 
@@ -64,6 +81,9 @@ sudo dnf install gtk4-devel libadwaita-devel
 
 # Debian / Ubuntu
 sudo apt install libgtk-4-dev libadwaita-1-dev
+
+# macOS (Homebrew)
+brew install gtk4 libadwaita librsvg
 ```
 
 ```sh
@@ -82,7 +102,7 @@ iso2god-next-gui [-o|--output DIR] [ISO_FILE ...]
 
 ## Command line
 
-The CLI has no GUI dependencies. Prebuilt binaries are on the releases page (see [Download](#download)), or build it yourself:
+The CLI has no GUI dependencies, so all it needs is Rust 1.85 or newer:
 
 ```sh
 cargo build --release

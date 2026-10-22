@@ -1,6 +1,6 @@
 //! High-level conversion pipeline: everything a frontend (CLI or GUI) needs to
-//! inspect an ISO image and turn it into a Games-On-Demand package, without
-//! having to know about the on-disk formats.
+//! inspect an ISO image (or a folder holding a game's files) and turn it into a
+//! Games-On-Demand package, without having to know about the on-disk formats.
 //!
 //! The pipeline is frontend-agnostic: it reports progress through a callback
 //! and can be cancelled cooperatively at any point, so it can be driven from a
@@ -17,6 +17,7 @@ use anyhow::{Context, Error, bail};
 use rayon::prelude::*;
 
 use crate::executable::{TitleExecutionInfo, TitleInfo};
+use crate::folder::FolderImage;
 use crate::god::{self, ContentType, FileLayout};
 use crate::{game_list, iso};
 
@@ -35,7 +36,19 @@ impl fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
+/// What kind of source a package is made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// An ISO image of a disc.
+    Iso,
+    /// A folder with the game's files, including a `default.xex` (or
+    /// `default.xbe`) at the top level.
+    Folder,
+}
+
 /// How much of the source image should be copied into the GOD package.
+///
+/// Folders have no unused space, so the mode only affects ISO images.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TrimMode {
     /// (default) Copy everything up to the last used byte of the image,
@@ -55,10 +68,11 @@ impl TrimMode {
     }
 }
 
-/// Options for a single ISO -> GOD conversion.
+/// Options for a single ISO (or folder) -> GOD conversion.
 #[derive(Clone, Debug)]
 pub struct ConvertOptions {
-    pub source_iso: PathBuf,
+    /// An ISO file or a game folder.
+    pub source: PathBuf,
     pub dest_dir: PathBuf,
     /// Overrides the game title stored in the CON header.
     pub game_title: Option<String>,
@@ -68,9 +82,9 @@ pub struct ConvertOptions {
 }
 
 impl ConvertOptions {
-    pub fn new(source_iso: impl Into<PathBuf>, dest_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(source: impl Into<PathBuf>, dest_dir: impl Into<PathBuf>) -> Self {
         ConvertOptions {
-            source_iso: source_iso.into(),
+            source: source.into(),
             dest_dir: dest_dir.into(),
             game_title: None,
             trim: TrimMode::default(),
@@ -87,16 +101,19 @@ pub fn default_num_threads() -> usize {
         .clamp(1, 8)
 }
 
-/// Everything that can be learned about an image without converting it.
+/// Everything that can be learned about an image or folder without converting
+/// it.
 #[derive(Clone, Debug)]
 pub struct IsoInfo {
+    pub kind: SourceKind,
     pub title_id: u32,
     pub title_name: Option<String>,
     pub content_type: ContentType,
     pub execution_info: TitleExecutionInfo,
-    /// Offset of the data volume inside the ISO file.
+    /// Offset of the data volume inside the ISO file (zero for folders).
     pub root_offset: u64,
-    /// Size of the ISO file on disk.
+    /// Size of the ISO file on disk; for a folder, the size of the volume
+    /// built from it.
     pub source_size: u64,
     /// Size of the data volume that would be converted.
     pub data_size: u64,
@@ -109,15 +126,11 @@ impl IsoInfo {
         format!("{:08X}", self.title_id)
     }
 
-    /// The known game title, falling back to the ISO's file name.
-    pub fn display_name(&self, source_iso: &Path) -> String {
+    /// The known game title, falling back to the name of the ISO or folder.
+    pub fn display_name(&self, source: &Path) -> String {
         self.title_name
             .clone()
-            .or_else(|| {
-                source_iso
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-            })
+            .or_else(|| source_name(source))
             .unwrap_or_else(|| "Unknown title".to_owned())
     }
 
@@ -215,14 +228,44 @@ impl CancelToken {
     }
 }
 
-/// Reads the metadata needed to display and convert an image.
-pub fn inspect(source_iso: &Path) -> Result<IsoInfo, Error> {
-    inspect_with_trim(source_iso, TrimMode::default())
+/// The file stem of an ISO, or the whole name of a folder (whose dots are
+/// usually part of the name, as in "Game v1.2").
+fn source_name(source: &Path) -> Option<String> {
+    let name = if source.is_dir() {
+        source.file_name()
+    } else {
+        source.file_stem()
+    };
+    name.map(|name| name.to_string_lossy().into_owned())
 }
 
-/// Reads the metadata needed to display and convert an image, using the given
-/// trimming mode to decide how large the converted data volume would be.
-pub fn inspect_with_trim(source_iso: &Path, trim: TrimMode) -> Result<IsoInfo, Error> {
+/// Where the data volume of a source comes from.
+enum Volume {
+    Iso { path: PathBuf, root_offset: u64 },
+    Folder(FolderImage),
+}
+
+/// Reads the metadata needed to display and convert an image or folder.
+pub fn inspect(source: &Path) -> Result<IsoInfo, Error> {
+    inspect_with_trim(source, TrimMode::default())
+}
+
+/// Reads the metadata needed to display and convert an image or folder, using
+/// the given trimming mode to decide how large the converted data volume would
+/// be.
+pub fn inspect_with_trim(source: &Path, trim: TrimMode) -> Result<IsoInfo, Error> {
+    open_volume(source, trim).map(|(info, _)| info)
+}
+
+fn open_volume(source: &Path, trim: TrimMode) -> Result<(IsoInfo, Volume), Error> {
+    if source.is_dir() {
+        open_folder(source)
+    } else {
+        open_iso(source, trim)
+    }
+}
+
+fn open_iso(source_iso: &Path, trim: TrimMode) -> Result<(IsoInfo, Volume), Error> {
     let file =
         File::open(source_iso).with_context(|| format!("cannot open {}", source_iso.display()))?;
     let source_size = fs::metadata(source_iso)
@@ -240,10 +283,44 @@ pub fn inspect_with_trim(source_iso: &Path, trim: TrimMode) -> Result<IsoInfo, E
         TrimMode::None => source_size.saturating_sub(root_offset),
     };
     let data_size = data_size.min(source_size.saturating_sub(root_offset));
+
+    let info = describe_source(
+        SourceKind::Iso,
+        title_info,
+        root_offset,
+        source_size,
+        data_size,
+    );
+    let volume = Volume::Iso {
+        path: source_iso.to_owned(),
+        root_offset,
+    };
+    Ok((info, volume))
+}
+
+fn open_folder(folder: &Path) -> Result<(IsoInfo, Volume), Error> {
+    let image = FolderImage::scan(folder)
+        .with_context(|| format!("cannot read the game files in {}", folder.display()))?;
+    let title_info = TitleInfo::from_folder(&image)
+        .with_context(|| format!("cannot read the executable in {}", folder.display()))?;
+
+    let size = image.volume_size();
+    let info = describe_source(SourceKind::Folder, title_info, 0, size, size);
+    Ok((info, Volume::Folder(image)))
+}
+
+fn describe_source(
+    kind: SourceKind,
+    title_info: TitleInfo,
+    root_offset: u64,
+    source_size: u64,
+    data_size: u64,
+) -> IsoInfo {
     let block_count = data_size.div_ceil(god::BLOCK_SIZE).max(1);
     let part_count = block_count.div_ceil(god::BLOCKS_PER_PART).max(1);
 
-    Ok(IsoInfo {
+    IsoInfo {
+        kind,
         title_id: title_info.execution_info.title_id,
         title_name: game_list::find_title_by_id(title_info.execution_info.title_id),
         content_type: title_info.content_type,
@@ -253,7 +330,26 @@ pub fn inspect_with_trim(source_iso: &Path, trim: TrimMode) -> Result<IsoInfo, E
         data_size,
         block_count,
         part_count,
-    })
+    }
+}
+
+/// A package written into the folder it was made from would be picked up by
+/// the next conversion, so refuse that up front.
+fn ensure_dest_outside_source(source: &Path, dest_dir: &Path) -> Result<(), Error> {
+    let source =
+        fs::canonicalize(source).with_context(|| format!("cannot resolve {}", source.display()))?;
+    let dest = fs::canonicalize(dest_dir)
+        .or_else(|_| std::path::absolute(dest_dir))
+        .with_context(|| format!("cannot resolve {}", dest_dir.display()))?;
+
+    if dest.starts_with(&source) {
+        bail!(
+            "the output folder {} is inside the game folder {}; choose a different output folder",
+            dest_dir.display(),
+            source.display()
+        );
+    }
+    Ok(())
 }
 
 /// Converts one ISO into the GOD layout inside `options.dest_dir`.
@@ -299,8 +395,10 @@ where
         bail!(Cancelled);
     }
 
-    let info = inspect_with_trim(&options.source_iso, options.trim)?;
-    let root_offset = info.root_offset;
+    let (info, volume) = open_volume(&options.source, options.trim)?;
+    if info.kind == SourceKind::Folder {
+        ensure_dest_outside_source(&options.source, &options.dest_dir)?;
+    }
 
     let file_layout = info.layout(&options.dest_dir);
     let data_dir = file_layout.data_dir_path();
@@ -322,12 +420,6 @@ where
             bail!(Cancelled);
         }
 
-        let mut iso_data_volume = File::open(&options.source_iso)
-            .with_context(|| format!("cannot open {}", options.source_iso.display()))?;
-        iso_data_volume
-            .seek(SeekFrom::Start(root_offset))
-            .context("cannot seek to the start of the data volume")?;
-
         let part_file = file_layout.part_file_path(part_index);
         let part_file = File::options()
             .write(true)
@@ -336,20 +428,33 @@ where
             .open(&part_file)
             .with_context(|| format!("cannot create {}", part_file.display()))?;
 
-        god::write_part_observed(
-            iso_data_volume,
-            part_index,
-            part_file,
-            |bytes| {
-                let done = done_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
-                on_progress(ConversionProgress {
-                    stage: Stage::WritingParts,
-                    done,
-                    total: total_bytes,
-                });
-            },
-            || cancel.is_cancelled(),
-        )
+        let on_bytes = |bytes| {
+            let done = done_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            on_progress(ConversionProgress {
+                stage: Stage::WritingParts,
+                done,
+                total: total_bytes,
+            });
+        };
+        let is_cancelled = || cancel.is_cancelled();
+
+        match &volume {
+            Volume::Iso { path, root_offset } => {
+                let mut data_volume =
+                    File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+                data_volume
+                    .seek(SeekFrom::Start(*root_offset))
+                    .context("cannot seek to the start of the data volume")?;
+                god::write_part_observed(data_volume, part_index, part_file, on_bytes, is_cancelled)
+            }
+            Volume::Folder(image) => god::write_part_observed(
+                image.open(),
+                part_index,
+                part_file,
+                on_bytes,
+                is_cancelled,
+            ),
+        }
         .with_context(|| format!("error writing part {part_index}"))?;
 
         Ok::<_, Error>(())

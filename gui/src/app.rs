@@ -1,5 +1,5 @@
-//! The application window: an ISO list, a destination picker and the convert
-//! action with per-image and overall progress.
+//! The application window: a list of ISO images and game folders, a destination
+//! picker and the convert action with per-game and overall progress.
 //!
 //! All conversion work happens on background threads (see [`crate::task`]); this
 //! component only reacts to messages and keeps the widgets in sync.
@@ -27,6 +27,7 @@ use crate::task::{self, FileOutcome, Job};
 #[derive(Debug)]
 pub(crate) enum AppMsg {
     AddRequested,
+    AddFolderRequested,
     FilesChosen(Vec<PathBuf>),
     Inspected(PathBuf, Result<Box<IsoInfo>, String>),
     Remove(usize),
@@ -45,7 +46,7 @@ pub(crate) enum AppMsg {
     About,
 }
 
-/// Startup state: ISO files passed on the command line and an optional
+/// Startup state: ISO files and game folders passed on the command line and an optional
 /// preselected output folder.
 #[derive(Debug, Default)]
 pub struct AppInit {
@@ -73,6 +74,7 @@ pub(crate) struct AppModel {
     ftp: FtpSettings,
     clear_button: Option<gtk::Button>,
     add_action: Option<gio::SimpleAction>,
+    add_folder_action: Option<gio::SimpleAction>,
     convert_action: Option<gio::SimpleAction>,
     cancel_action: Option<gio::SimpleAction>,
 }
@@ -100,6 +102,11 @@ impl SimpleComponent for AppModel {
                             set_tooltip_text: Some("Add ISO images (Ctrl+O)"),
                             set_action_name: Some("app.add"),
                         },
+                        pack_start = &gtk::Button {
+                            set_label: "Add XEX Folder",
+                            set_tooltip_text: Some("Add folders that contain a default.xex (Ctrl+Shift+O)"),
+                            set_action_name: Some("app.add-folder"),
+                        },
 
                         #[wrap(Some)]
                         set_title_widget = &adw::WindowTitle {
@@ -121,6 +128,12 @@ impl SimpleComponent for AppModel {
                                     gtk::Button {
                                         set_label: "Add ISO images",
                                         set_action_name: Some("app.add"),
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "flat",
+                                    },
+                                    gtk::Button {
+                                        set_label: "Add XEX folder",
+                                        set_action_name: Some("app.add-folder"),
                                         set_halign: gtk::Align::Start,
                                         add_css_class: "flat",
                                     },
@@ -151,9 +164,9 @@ impl SimpleComponent for AppModel {
                             #[watch]
                             set_visible: model.entries.is_empty(),
                             set_icon_name: Some("media-optical-symbolic"),
-                            set_title: "No ISO images",
+                            set_title: "No games added",
                             set_description: Some(
-                                "Add Xbox 360 or original Xbox ISO images, choose an output folder, then convert them to Games on Demand format."
+                                "Add Xbox 360 or original Xbox ISO images, or folders that contain a game's files with its default.xex, choose an output folder, then convert them to Games on Demand format."
                             ),
 
                             #[wrap(Some)]
@@ -173,9 +186,16 @@ impl SimpleComponent for AppModel {
                                         add_css_class: "suggested-action",
                                     },
                                     gtk::Button {
-                                        set_label: "Choose output folder",
-                                        set_action_name: Some("app.choose-output"),
+                                        set_label: "Add XEX folder",
+                                        set_action_name: Some("app.add-folder"),
                                     },
+                                },
+
+                                gtk::Button {
+                                    set_label: "Choose output folder",
+                                    set_action_name: Some("app.choose-output"),
+                                    set_halign: gtk::Align::Center,
+                                    add_css_class: "flat",
                                 },
 
                                 #[name = "empty_output_label"]
@@ -196,8 +216,8 @@ impl SimpleComponent for AppModel {
 
                             #[name = "iso_group"]
                             adw::PreferencesGroup {
-                                set_title: "ISO images",
-                                set_description: Some("Images are converted one after another into the output folder."),
+                                set_title: "Games",
+                                set_description: Some("Images and folders are converted one after another into the output folder."),
                             },
 
                             #[name = "destination_group"]
@@ -300,7 +320,7 @@ impl SimpleComponent for AppModel {
         let mut seen = HashSet::new();
         for path in init.files {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
-            if path.is_file() && seen.insert(path.clone()) {
+            if (path.is_file() || path.is_dir()) && seen.insert(path.clone()) {
                 entries.push(IsoEntry::new(path));
             }
         }
@@ -326,6 +346,7 @@ impl SimpleComponent for AppModel {
             ftp: FtpSettings::load(),
             clear_button: None,
             add_action: None,
+            add_folder_action: None,
             convert_action: None,
             cancel_action: None,
         };
@@ -334,7 +355,7 @@ impl SimpleComponent for AppModel {
         let widgets = view_output!();
         model.group = widgets.iso_group.clone();
 
-        // Extra actions in the "ISO images" group header.
+        // Extra actions in the "Games" group header.
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let add_button = gtk::Button::builder()
             .icon_name("list-add-symbolic")
@@ -342,14 +363,21 @@ impl SimpleComponent for AppModel {
             .css_classes(["flat"])
             .build();
         add_button.set_action_name(Some("app.add"));
+        let add_folder_button = gtk::Button::builder()
+            .icon_name("folder-new-symbolic")
+            .tooltip_text("Add XEX folders")
+            .css_classes(["flat"])
+            .build();
+        add_folder_button.set_action_name(Some("app.add-folder"));
         let clear_button = gtk::Button::builder()
             .label("Clear")
-            .tooltip_text("Remove all ISO images")
+            .tooltip_text("Remove all games from the list")
             .css_classes(["flat"])
             .build();
         let clear_sender = sender.clone();
         clear_button.connect_clicked(move |_| clear_sender.input(AppMsg::Clear));
         controls.append(&add_button);
+        controls.append(&add_folder_button);
         controls.append(&clear_button);
         widgets.iso_group.set_header_suffix(Some(&controls));
         model.clear_button = Some(clear_button);
@@ -363,6 +391,14 @@ impl SimpleComponent for AppModel {
         app.add_action(&add_action);
         app.set_accels_for_action("app.add", &["<primary>o"]);
         model.add_action = Some(add_action);
+
+        let add_folder_action = gio::SimpleAction::new("add-folder", None);
+        let add_folder_sender = sender.clone();
+        add_folder_action
+            .connect_activate(move |_, _| add_folder_sender.input(AppMsg::AddFolderRequested));
+        app.add_action(&add_folder_action);
+        app.set_accels_for_action("app.add-folder", &["<primary><shift>o"]);
+        model.add_folder_action = Some(add_folder_action);
 
         let choose_action = gio::SimpleAction::new("choose-output", None);
         let choose_sender = sender.clone();
@@ -395,7 +431,7 @@ impl SimpleComponent for AppModel {
         app.add_action(&about_action);
         app.set_accels_for_action("app.about", &["F1"]);
 
-        // Dropping ISO files anywhere on the window adds them.
+        // Dropping ISO files or game folders anywhere on the window adds them.
         let drop_target = gtk::DropTarget::new(
             gtk::gdk::FileList::static_type(),
             gtk::gdk::DragAction::COPY,
@@ -434,6 +470,13 @@ impl SimpleComponent for AppModel {
                 self.open_iso_dialog(&sender);
             }
 
+            AppMsg::AddFolderRequested => {
+                if self.converting {
+                    return;
+                }
+                self.open_folder_dialog(&sender);
+            }
+
             AppMsg::FilesChosen(paths) => {
                 if self.converting {
                     self.toast("Wait for the current conversion to finish.");
@@ -450,7 +493,7 @@ impl SimpleComponent for AppModel {
                 let mut added = Vec::new();
                 for path in paths {
                     let path = std::fs::canonicalize(&path).unwrap_or(path);
-                    if !path.is_file() || !known.insert(path.clone()) {
+                    if !(path.is_file() || path.is_dir()) || !known.insert(path.clone()) {
                         continue;
                     }
 
@@ -527,7 +570,7 @@ impl SimpleComponent for AppModel {
                     .iter()
                     .any(|entry| matches!(entry.state, EntryState::Inspecting))
                 {
-                    self.toast("Still reading ISO metadata…");
+                    self.toast("Still reading game details…");
                     return;
                 }
 
@@ -548,7 +591,7 @@ impl SimpleComponent for AppModel {
                     .collect();
 
                 if jobs.is_empty() {
-                    self.toast("Add at least one ISO image.");
+                    self.toast("Add at least one game.");
                     return;
                 }
 
@@ -654,7 +697,7 @@ impl SimpleComponent for AppModel {
                     self.toast("Conversion cancelled");
                 } else if self.failed > 0 {
                     self.toast(&format!(
-                        "{} of {} images converted · {} failed",
+                        "{} of {} games converted · {} failed",
                         self.completed,
                         self.active_job.len(),
                         self.failed
@@ -662,13 +705,13 @@ impl SimpleComponent for AppModel {
                 } else if self.completed > 0 {
                     let message = if self.uploaded == self.completed {
                         format!(
-                            "Converted and uploaded {} image{}",
+                            "Converted and uploaded {} game{}",
                             self.completed,
                             if self.completed == 1 { "" } else { "s" }
                         )
                     } else {
                         format!(
-                            "Converted {} image{}",
+                            "Converted {} game{}",
                             self.completed,
                             if self.completed == 1 { "" } else { "s" }
                         )
@@ -734,7 +777,7 @@ impl AppModel {
     fn convert_label(&self) -> String {
         match self.convertible_count() {
             0 | 1 => "Convert".to_owned(),
-            count => format!("Convert {count} ISOs"),
+            count => format!("Convert {count} games"),
         }
     }
 
@@ -765,6 +808,9 @@ impl AppModel {
         if let Some(action) = &self.add_action {
             action.set_enabled(!self.converting);
         }
+        if let Some(action) = &self.add_folder_action {
+            action.set_enabled(!self.converting);
+        }
         if let Some(clear) = &self.clear_button {
             clear.set_sensitive(!self.converting && !self.entries.is_empty());
         }
@@ -778,7 +824,7 @@ impl AppModel {
         self.sync_rows(sender);
     }
 
-    /// Progress over the ISO images of the current (or last) run.
+    /// Progress over the games of the current (or last) run.
     fn overall_fraction(&self) -> f64 {
         if self.active_job.is_empty() {
             return 0.0;
@@ -844,7 +890,7 @@ impl AppModel {
         }
 
         if self.entries.is_empty() {
-            return "No ISO images added".to_owned();
+            return "No games added".to_owned();
         }
 
         let count = self.entries.len();
@@ -855,7 +901,7 @@ impl AppModel {
             .sum();
 
         format!(
-            "{count} image{} · {}",
+            "{count} game{} · {}",
             if count == 1 { "" } else { "s" },
             format::size(total)
         )
@@ -945,7 +991,42 @@ impl AppModel {
         });
     }
 
-    /// Folder of the most recently added ISO, used as the picker's start folder.
+    /// Lets the user pick game folders, each holding a default.xex (or
+    /// default.xbe) with the rest of the game's files.
+    fn open_folder_dialog(&self, sender: &ComponentSender<Self>) {
+        let mut builder = gtk::FileDialog::builder()
+            .title("Add XEX folders")
+            .accept_label("Add")
+            .modal(true);
+
+        if let Some(dir) = self.current_source_dir() {
+            builder = builder.initial_folder(&gio::File::for_path(dir));
+        }
+        let dialog = builder.build();
+
+        let window = self.window.clone();
+        let sender = sender.clone();
+        relm4::spawn_local(async move {
+            let Ok(folders) = dialog.select_multiple_folders_future(Some(&window)).await else {
+                return;
+            };
+
+            let paths: Vec<PathBuf> = (0..folders.n_items())
+                .filter_map(|index| {
+                    folders
+                        .item(index)
+                        .and_downcast::<gio::File>()
+                        .and_then(|file| file.path())
+                })
+                .collect();
+
+            if !paths.is_empty() {
+                sender.input(AppMsg::FilesChosen(paths));
+            }
+        });
+    }
+
+    /// Folder of the most recently added game, used as the picker's start folder.
     fn current_source_dir(&self) -> Option<PathBuf> {
         self.entries
             .last()
@@ -991,7 +1072,7 @@ impl AppModel {
             .website("https://github.com/georgewoodall82/iso2god-next")
             .license_type(gtk::License::MitX11)
             .comments(
-                "Convert Xbox 360 and original Xbox ISO images to the Games on Demand format.",
+                "Convert Xbox 360 and original Xbox ISO images and game folders to the Games on Demand format.",
             )
             .build();
 

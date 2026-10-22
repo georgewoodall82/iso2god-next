@@ -1,8 +1,8 @@
-//! The data the GUI keeps for every ISO image in the list.
+//! The data the GUI keeps for every ISO image or game folder in the list.
 
 use std::path::PathBuf;
 
-use iso2god_next::{ConversionProgress, IsoInfo};
+use iso2god_next::{ConversionProgress, IsoInfo, SourceKind};
 
 use crate::ftp::UploadProgress;
 
@@ -48,16 +48,24 @@ impl IsoEntry {
             .unwrap_or_else(|| self.path.display().to_string())
     }
 
-    /// Known game title, or the file stem for images the title database
-    /// doesn't know about.
+    /// Known game title, or the file stem (folder name) for games the title
+    /// database doesn't know about.
     pub fn title(&self) -> String {
         match &self.info {
             Some(info) => info.display_name(&self.path),
+            None if self.path.is_dir() => self.file_name(),
             None => self
                 .path
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.file_name()),
+        }
+    }
+
+    pub fn is_folder(&self) -> bool {
+        match &self.info {
+            Some(info) => info.kind == SourceKind::Folder,
+            None => self.path.is_dir(),
         }
     }
 

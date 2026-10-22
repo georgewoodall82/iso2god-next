@@ -6,15 +6,17 @@ use anyhow::{Context, Error};
 
 use clap::{Parser, ValueEnum};
 
-use iso2god_next::convert::{self, ConversionProgress, ConvertOptions, Stage, TrimMode};
+use iso2god_next::convert::{
+    self, ConversionProgress, ConvertOptions, SourceKind, Stage, TrimMode,
+};
 use iso2god_next::god::ContentType;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(color = clap::ColorChoice::Never)]
 struct Cli {
-    /// ISO file to convert
-    source_iso: PathBuf,
+    /// ISO file, or folder holding a game's files (with a default.xex), to convert
+    source: PathBuf,
 
     /// A folder to write resulting GOD files to
     dest_dir: PathBuf,
@@ -27,7 +29,7 @@ struct Cli {
     #[arg(long, value_name = "TITLE")]
     game_title: Option<String>,
 
-    /// Whether to trim off unused space from the ISO image;
+    /// Whether to trim off unused space from the ISO image (folders have none);
     /// passing no --trim flag at all is equivalent to "from-end"
     #[arg(
         verbatim_doc_comment,
@@ -79,10 +81,19 @@ fn main() -> Result<(), Error> {
 
     let trim = args.trim.unwrap_or_default().core();
 
-    println!("extracting ISO metadata");
+    let is_folder = args.source.is_dir();
+    println!(
+        "extracting {} metadata",
+        if is_folder { "folder" } else { "ISO" }
+    );
 
-    let info =
-        convert::inspect_with_trim(&args.source_iso, trim).context("error reading source ISO")?;
+    let info = convert::inspect_with_trim(&args.source, trim).with_context(|| {
+        if is_folder {
+            "error reading source folder"
+        } else {
+            "error reading source ISO"
+        }
+    })?;
 
     println!("Title ID: {}", info.title_id_string());
     println!(
@@ -96,11 +107,14 @@ fn main() -> Result<(), Error> {
             ContentType::XboxOriginal => "Xbox Original",
         }
     );
-    println!(
-        "    Size: {} -> {}",
-        format_size(info.source_size),
-        format_size(info.data_size)
-    );
+    match info.kind {
+        SourceKind::Iso => println!(
+            "    Size: {} -> {}",
+            format_size(info.source_size),
+            format_size(info.data_size)
+        ),
+        SourceKind::Folder => println!("    Size: {}", format_size(info.data_size)),
+    }
 
     if args.dry_run {
         return Ok(());
@@ -109,7 +123,7 @@ fn main() -> Result<(), Error> {
     println!("clearing data directory");
 
     let options = ConvertOptions {
-        source_iso: args.source_iso,
+        source: args.source,
         dest_dir: args.dest_dir,
         game_title: args.game_title,
         trim,

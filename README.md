@@ -1,7 +1,7 @@
 <h1 align="center">iso2god-next</h1>
 
 <p align="center">
-  Convert Xbox 360 and original Xbox ISO images into <strong>Games on Demand</strong> packages,<br>
+  Convert Xbox 360 and original Xbox ISO images, or plain game folders, into <strong>Games on Demand</strong> packages,<br>
   from a native desktop app or the command line, and send them straight to your console over FTP.
 </p>
 
@@ -11,7 +11,8 @@
 
 ## Features
 
-- **Desktop app** built with GTK4 and libadwaita: add several ISOs at once (button, drag and drop, or command line), see per-image and overall progress, and cancel at any time.
+- **Desktop app** built with GTK4 and libadwaita: add several ISOs or game folders at once (buttons, drag and drop, or command line), see per-game and overall progress, and cancel at any time.
+- **Game folders**: point it at a folder that contains a `default.xex` and it converts the files directly, with no need to rebuild an ISO first.
 - **FTP upload** to the console: after each conversion the finished package is copied to the Xbox 360 (Aurora, Freestyle Dash, XeXMenu and other FTP servers), with its own progress bar.
 - **Command line tool** for scripting and batch jobs.
 - **Fast**: part files are written in parallel across worker threads.
@@ -56,18 +57,27 @@ The command line tool is not part of the releases; build it from source (see [Co
 
 ## Desktop app
 
-1. **Add ISOs** with the button, by dragging files into the window, or on the command line.
+1. **Add games** with **Add ISOs** or **Add XEX Folder**, by dragging ISO files or folders into the window, or on the command line.
 2. **Choose an output folder.**
-3. **Convert.** Images are converted one after another, and a toast tells you when everything is done.
+3. **Convert.** Games are converted one after another, and a toast tells you when everything is done.
 4. **Upload (optional).** Open **Settings → FTP upload**, enter the console's IP address and use **Test connection** to check it. The username and password default to `xboxftp`. Converted games are copied to `Hdd1:\Content\0000000000000000` unless you change the content folder.
 
 | Shortcut | Action |
 | -------- | ------ |
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | Add ISOs |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> | Add XEX folders |
 | <kbd>Ctrl</kbd>+<kbd>Return</kbd> | Convert |
 | <kbd>Esc</kbd> | Cancel the running conversion |
 | <kbd>Ctrl</kbd>+<kbd>,</kbd> | Settings |
 | <kbd>F1</kbd> | About |
+
+### Game folders
+
+A game folder is the contents of a disc or an extracted ISO: a `default.xex` (Xbox 360) or `default.xbe` (original Xbox) at the top level, next to the game's other files and subfolders. The app lays the folder out as the disc's data volume while it converts, so nothing extra is written to disk and the result is the same package an ISO would give.
+
+- The output folder must not be inside the game folder.
+- File and folder names have to be plain ASCII (at most 255 characters), no two names in a folder may differ only in letter case, and no single file can be 4 GiB or larger. These are limits of the disc format; the app tells you which file is the problem.
+- `.DS_Store`, `Thumbs.db`, `desktop.ini` and `._*` files are left out.
 
 FTP settings are saved to `iso2god-next/ftp.json` in your user configuration folder (`~/.config` on Linux and macOS, `%APPDATA%` on Windows). The password is stored in plain text. On Linux and macOS the file is created readable only by you.
 
@@ -95,7 +105,7 @@ cargo run --release -p iso2god-next-gui
 Optional arguments:
 
 ```sh
-iso2god-next-gui [-o|--output DIR] [ISO_FILE ...]
+iso2god-next-gui [-o|--output DIR] [ISO_FILE|FOLDER ...]
 ```
 
 [`gui/data/`](gui/data) contains a desktop entry and an icon if you want to install the app system-wide.
@@ -107,26 +117,29 @@ The CLI has no GUI dependencies, so all it needs is Rust 1.85 or newer:
 ```sh
 cargo build --release
 ./target/release/iso2god-next game.iso ./output
+
+# or straight from a folder that contains default.xex
+./target/release/iso2god-next ./MyGame ./output
 ```
 
 ```
-Usage: iso2god-next [OPTIONS] <SOURCE_ISO> <DEST_DIR>
+Usage: iso2god-next [OPTIONS] <SOURCE> <DEST_DIR>
 
 Arguments:
-  <SOURCE_ISO>  ISO file to convert
-  <DEST_DIR>    A folder to write resulting GOD files to
+  <SOURCE>    ISO file, or folder holding a game's files (with a default.xex), to convert
+  <DEST_DIR>  A folder to write resulting GOD files to
 
 Options:
       --dry-run             Do not convert anything, just print the title info
       --game-title <TITLE>  Set game title
-      --trim[=<TRIM>]       Whether to trim off unused space from the ISO image;
+      --trim[=<TRIM>]       Whether to trim off unused space from the ISO image (folders have none);
                             passing no --trim flag at all is equivalent to "from-end" [possible values: from-end, none]
   -j, --num-threads <N>     Number of worker threads to use [default: 1]
   -h, --help                Print help (see more with '--help')
   -V, --version             Print version
 ```
 
-`--dry-run` prints the title ID, name, type and the size before and after trimming without writing anything.
+`--dry-run` prints the title ID, name, type and the size (before and after trimming, for an ISO) without writing anything.
 
 ## Using the library
 
@@ -135,13 +148,14 @@ The conversion pipeline has no UI code in it, so you can call it from your own p
 ```rust
 use iso2god_next::{convert, ConvertOptions};
 
+// the source is an ISO file or a folder with a default.xex
 let options = ConvertOptions::new("game.iso", "output");
 convert(&options, |progress| {
     println!("{}: {:.0}%", progress.stage.label(), progress.fraction() * 100.0);
 })?;
 ```
 
-`inspect()` reads an image's metadata without converting it, and `convert_cancellable()` takes a `CancelToken` so long conversions can be stopped.
+`inspect()` reads an image's or folder's metadata without converting it, and `convert_cancellable()` takes a `CancelToken` so long conversions can be stopped.
 
 ## Project layout
 
@@ -149,6 +163,7 @@ convert(&options, |progress| {
 | ---- | ------- |
 | `src/convert.rs` | The conversion pipeline: `inspect()`, `convert()`, progress and cancellation |
 | `src/iso/`, `src/god/`, `src/executable/`, `src/game_list/` | ISO parsing, Games on Demand writing and the title database |
+| `src/folder.rs` | Presents a game folder as an Xbox disc volume, built on the fly |
 | `src/bin/iso2god-next.rs` | Command line frontend |
 | `gui/src/app.rs` | Main window |
 | `gui/src/row.rs` | One row per ISO, with its own progress bar |
@@ -163,7 +178,7 @@ convert(&options, |progress| {
 cargo test --all
 ```
 
-The integration tests build a tiny synthetic Xbox image, convert it, and check the resulting data file and CON header, so the whole pipeline is covered without a retail disc image. The FTP code is tested against an in-process mock server.
+The integration tests build a tiny synthetic Xbox image (and a matching game folder), convert it, and check the resulting data file and CON header, so the whole pipeline is covered without a retail disc image. The FTP code is tested against an in-process mock server.
 
 ## Credits and licence
 

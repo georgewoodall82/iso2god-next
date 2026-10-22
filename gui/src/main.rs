@@ -47,7 +47,7 @@ fn parse_args() -> (String, app::AppInit) {
                 }
             }
             Some("--help") | Some("-h") => {
-                println!("Usage: iso2god-next-gui [OPTIONS] [ISO_FILE…]");
+                println!("Usage: iso2god-next-gui [OPTIONS] [ISO_FILE|FOLDER…]");
                 println!();
                 println!("Options:");
                 println!(

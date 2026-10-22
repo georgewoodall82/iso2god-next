@@ -56,7 +56,7 @@ pub fn convert_all(
             }
 
             let options = ConvertOptions {
-                source_iso: job.path.clone(),
+                source: job.path.clone(),
                 dest_dir: dest_dir.clone(),
                 game_title: None,
                 trim: TrimMode::FromEnd,

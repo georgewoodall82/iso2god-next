@@ -1,8 +1,9 @@
-//! One row in the ISO list: title, details, optional live progress and a remove
+//! One row in the game list: title, details, optional live progress and a remove
 //! button. Rows are plain `AdwActionRow`s updated in place.
 
 use std::path::PathBuf;
 
+use iso2god_next::SourceKind;
 use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk;
@@ -23,7 +24,7 @@ pub struct IsoRow {
 
 impl IsoRow {
     pub fn new(index: usize, entry: &IsoEntry, sender: &ComponentSender<AppModel>) -> Self {
-        let icon = gtk::Image::from_icon_name(icon_for(&entry.state));
+        let icon = gtk::Image::from_icon_name(icon_for(entry));
         icon.set_valign(gtk::Align::Center);
         icon.add_css_class("dim-label");
 
@@ -91,7 +92,7 @@ impl IsoRow {
                 .set_label(&format!("{}%", format::percent(fraction)));
         }
 
-        self.icon.set_icon_name(Some(icon_for(&entry.state)));
+        self.icon.set_icon_name(Some(icon_for(entry)));
         self.icon.set_css_classes(icon_classes(&entry.state));
         self.remove.set_sensitive(
             !app_converting
@@ -108,7 +109,7 @@ impl IsoRow {
 
 fn subtitle(entry: &IsoEntry) -> String {
     match &entry.state {
-        EntryState::Inspecting => "Reading ISO image…".to_owned(),
+        EntryState::Inspecting => "Reading…".to_owned(),
         EntryState::Queued => "Waiting to convert…".to_owned(),
         EntryState::Converting(progress) => format!(
             "{} · {}%",
@@ -139,7 +140,12 @@ fn subtitle(entry: &IsoEntry) -> String {
         EntryState::Failed(message) => format!("Failed: {message}"),
         EntryState::Ready => match &entry.info {
             Some(info) => format!(
-                "{} · {} · Title ID {}",
+                "{}{} · {} · Title ID {}",
+                if info.kind == SourceKind::Folder {
+                    "Folder · "
+                } else {
+                    ""
+                },
                 info.content_type.description(),
                 format::size(info.data_size),
                 info.title_id_string()
@@ -157,8 +163,8 @@ fn icon_classes(state: &EntryState) -> &'static [&'static str] {
     }
 }
 
-fn icon_for(state: &EntryState) -> &'static str {
-    match state {
+fn icon_for(entry: &IsoEntry) -> &'static str {
+    match &entry.state {
         EntryState::Inspecting | EntryState::Queued | EntryState::Converting(_) => {
             "view-refresh-symbolic"
         }
@@ -166,6 +172,7 @@ fn icon_for(state: &EntryState) -> &'static str {
         EntryState::Done { .. } => "object-select-symbolic",
         EntryState::Failed(_) => "dialog-error-symbolic",
         EntryState::Cancelled => "media-playback-stop-symbolic",
+        EntryState::Ready if entry.is_folder() => "folder-symbolic",
         EntryState::Ready => "media-optical-symbolic",
     }
 }

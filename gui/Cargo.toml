@@ -1,6 +1,6 @@
 [package]
 name = "iso2god-next-gui"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "A GTK4/libadwaita frontend for iso2god-next"
 license = "MIT"

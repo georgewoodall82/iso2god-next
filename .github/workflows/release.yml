@@ -184,13 +184,43 @@ jobs:
           # gdk-pixbuf image loaders (SVG icons need the librsvg one)
           cp -r /ucrt64/lib/gdk-pixbuf-2.0 "$dist/lib/"
 
-          # every UCRT64 DLL that the executable and the loaders need
-          roots=("$dist/iso2god-next-gui.exe")
-          while IFS= read -r -d '' dll; do roots+=("$dll"); done \
-            < <(find "$dist/lib/gdk-pixbuf-2.0" -name '*.dll' -print0)
-          for root in "${roots[@]}"; do
-            ldd "$root" | awk '/\/ucrt64\//{print $3}'
-          done | sort -u | while read -r dll; do cp "$dll" "$dist/"; done
+          # Every UCRT64 DLL that the executable, the DLLs and the loaders
+          # import, until nothing new turns up. This reads the import tables
+          # rather than using ldd, which reports Windows' own copy of a DLL that
+          # exists in both places (vulkan-1.dll): the app then ends up using
+          # whatever Vulkan loader the user's machine has, and an old one fails
+          # with "entry point vkBindImageMemory2 not found".
+          bundled_files() {
+            find "$dist" -maxdepth 1 \( -name '*.exe' -o -name '*.dll' \) -print
+            find "$dist/lib/gdk-pixbuf-2.0" -name '*.dll' -print
+          }
+          changed=1
+          while [ "$changed" = 1 ]; do
+            changed=0
+            while IFS= read -r file; do
+              for name in $(objdump -p "$file" | awk '/DLL Name:/{print $3}'); do
+                if [ -e "/ucrt64/bin/$name" ] && [ ! -e "$dist/$name" ]; then
+                  cp "/ucrt64/bin/$name" "$dist/"
+                  changed=1
+                fi
+              done
+            done < <(bundled_files)
+          done
+
+          # Nothing may be left to chance: every import has to be in the folder
+          # or be a Windows system DLL (the Vulkan loader is never one of those).
+          test -e "$dist/vulkan-1.dll" || { echo "vulkan-1.dll is missing from the bundle"; exit 1; }
+          missing=0
+          while IFS= read -r file; do
+            for name in $(objdump -p "$file" | awk '/DLL Name:/{print $3}'); do
+              case "$name" in api-ms-*) continue ;; esac
+              if [ ! -e "$dist/$name" ] && [ ! -e "/c/Windows/System32/$name" ]; then
+                echo "$file needs $name, which is not in the bundle"
+                missing=1
+              fi
+            done
+          done < <(bundled_files)
+          [ "$missing" = 0 ]
 
           cp -r /ucrt64/share/glib-2.0/schemas "$dist/share/glib-2.0/"
           cp -r /ucrt64/share/icons/Adwaita "$dist/share/icons/"

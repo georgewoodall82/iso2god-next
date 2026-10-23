@@ -22,7 +22,7 @@
 
 ## Download
 
-Grab the latest build from the [releases page](https://github.com/georgewoodall82/iso2god-next/releases). File names include the version, shown here as `<version>` (for example `v1.2.0`).
+Grab the latest build from the [releases page](https://github.com/georgewoodall82/iso2god-next/releases). File names include the version, shown here as `<version>` (for example `v1.2.1`).
 
 | Platform | File | Status |
 | -------- | ---- | ------ |

@@ -14,7 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  APP_ID: io.github.georgewoodall82.Iso2godNext
+  APP_ID: io.github.georgewoodall82.iso2god-next
 
 # Every job builds the desktop app and attaches one file named
 # iso2god-next-<version>-<platform>-<arch>.<ext> to the release. Pushes to a

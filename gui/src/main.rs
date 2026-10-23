@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use relm4::RelmApp;
 
 /// Reverse-DNS application ID, used for the window's app icon and actions.
-pub const APP_ID: &str = "io.github.georgewoodall82.Iso2godNext";
+pub const APP_ID: &str = "io.github.georgewoodall82.iso2god-next";
 
 fn main() {
     let (program, init) = parse_args();

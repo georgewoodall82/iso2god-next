@@ -121,6 +121,8 @@ fn subtitle(entry: &IsoEntry) -> String {
                 "Connecting to the Xbox…".to_owned()
             } else if progress.files_done >= progress.files_total {
                 "Uploaded to the Xbox".to_owned()
+            } else if let Some(notice) = &progress.notice {
+                notice.clone()
             } else {
                 let mut text = if progress.file.is_empty() {
                     format!(

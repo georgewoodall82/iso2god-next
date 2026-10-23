@@ -7,15 +7,15 @@
 //! phase after the conversion itself is finished.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Error, bail};
 use iso2god_next::{CancelToken, Cancelled};
-use suppaftp::FtpStream;
 use suppaftp::types::FileType;
+use suppaftp::{FtpError, FtpStream, ImplFtpStream, TlsStream, TransferStream};
 
 use crate::settings::FtpSettings;
 
@@ -25,6 +25,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Give up when the console stops answering for this long, so a dropped Wi-Fi
 /// link cannot leave the conversion worker stuck forever.
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
+/// A data write that blocks this long means the console has stopped reading.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for the console's reply when a transfer is being dropped.
+const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 const COPY_BUFFER_SIZE: usize = 128 * 1024;
 
 /// Progress of one package upload.
@@ -39,6 +43,8 @@ pub struct UploadProgress {
     pub file: String,
     /// Smoothed upload speed, once enough time has passed to measure one.
     pub bytes_per_sec: Option<f64>,
+    /// Set while the upload is waiting to reconnect after the console stalled.
+    pub notice: Option<String>,
 }
 
 impl UploadProgress {
@@ -64,10 +70,10 @@ impl SpeedMeter {
     /// Weight of the newest window in the running average.
     const SMOOTHING: f64 = 0.3;
 
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, done: u64) -> Self {
         SpeedMeter {
             window_start: now,
-            window_done: 0,
+            window_done: done,
             rate: None,
         }
     }
@@ -320,9 +326,124 @@ fn enter_or_create(ftp: &mut FtpStream, component: &str) -> Result<String, Error
     bail!("cannot create the folder {component} on the Xbox")
 }
 
+/// A file transfer that may be retried: where the upload stands, so a fresh
+/// connection can carry on from there.
+struct Session {
+    /// Index of the file being sent (all earlier files are complete).
+    file: usize,
+    /// Bytes of that file already written to the console.
+    sent: u64,
+    /// Whether any connection has got as far as the content folder. Until then a
+    /// failure is a configuration problem (wrong address, wrong password), not a
+    /// stall, and is reported at once instead of retried.
+    connected: bool,
+    /// Cleared when the console resumed a file incorrectly, so the retry sends
+    /// that file again from the start and never trusts `REST` again.
+    resume_allowed: bool,
+}
+
+impl Session {
+    fn completed_bytes(&self, files: &[PackageFile]) -> u64 {
+        files[..self.file.min(files.len())]
+            .iter()
+            .map(|file| file.size)
+            .sum()
+    }
+
+    fn done(&self, files: &[PackageFile]) -> u64 {
+        self.completed_bytes(files) + self.sent
+    }
+
+    fn progress(
+        &self,
+        files: &[PackageFile],
+        total: u64,
+        bytes_per_sec: Option<f64>,
+        notice: Option<String>,
+    ) -> UploadProgress {
+        UploadProgress {
+            done: self.done(files),
+            total,
+            files_done: self.file,
+            files_total: files.len(),
+            file: files
+                .get(self.file)
+                .and_then(|file| file.relative.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            bytes_per_sec,
+            notice,
+        }
+    }
+
+    /// A failure while connecting or logging in: fatal on the very first
+    /// connection, a stall afterwards.
+    fn setup_failure(&self, error: Error) -> Failure {
+        if self.connected {
+            Failure::Retry(error)
+        } else {
+            Failure::Fatal(error)
+        }
+    }
+}
+
+/// How an upload attempt ended badly.
+enum Failure {
+    /// Retrying cannot help (cancelled, bad settings, unreadable local file).
+    Fatal(Error),
+    /// The connection broke or the console stopped answering; try again.
+    Retry(Error),
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Failure::Retry(error)
+    }
+}
+
+/// How hard to try again when the console stalls or drops the connection.
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    /// Give up after this many attempts in a row that moved no data forward.
+    max_failed_attempts: u32,
+    first_delay: Duration,
+    max_delay: Duration,
+}
+
+const RETRY_POLICY: RetryPolicy = RetryPolicy {
+    max_failed_attempts: 8,
+    first_delay: Duration::from_secs(5),
+    max_delay: Duration::from_secs(30),
+};
+
 /// Uploads the contents of `package_dir` (a `<TitleID>/<ContentType>` folder)
 /// into `remote_relative` below the configured content folder on the console.
+///
+/// Consoles sometimes stall for minutes in the middle of a large transfer. When
+/// that happens the upload reconnects and carries on with the current file
+/// (resuming it when the server supports that) instead of failing outright.
 pub fn upload_package<F>(
+    settings: &FtpSettings,
+    package_dir: &Path,
+    remote_relative: &Path,
+    cancel: &CancelToken,
+    on_progress: F,
+) -> Result<(), Error>
+where
+    F: FnMut(UploadProgress),
+{
+    upload_package_with(
+        RETRY_POLICY,
+        settings,
+        package_dir,
+        remote_relative,
+        cancel,
+        on_progress,
+    )
+}
+
+fn upload_package_with<F>(
+    policy: RetryPolicy,
     settings: &FtpSettings,
     package_dir: &Path,
     remote_relative: &Path,
@@ -339,117 +460,335 @@ where
     }
 
     let total: u64 = files.iter().map(|file| file.size).sum();
-    let files_total = files.len();
+    let mut session = Session {
+        file: 0,
+        sent: 0,
+        connected: false,
+        resume_allowed: true,
+    };
+    let mut failed_attempts = 0u32;
 
-    let mut ftp = connect(settings)?;
+    loop {
+        let done_before = session.done(&files);
+        let error = match upload_attempt(
+            settings,
+            &files,
+            remote_relative,
+            total,
+            cancel,
+            &mut session,
+            &mut on_progress,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(Failure::Fatal(error)) => return Err(error),
+            Err(Failure::Retry(error)) => error,
+        };
 
-    let result = (|| -> Result<(), Error> {
+        if cancel.is_cancelled() || error.is::<Cancelled>() {
+            return Err(Cancelled.into());
+        }
+
+        if session.done(&files) > done_before {
+            failed_attempts = 0;
+        }
+        failed_attempts += 1;
+        if failed_attempts >= policy.max_failed_attempts {
+            return Err(error.context(format!(
+                "the Xbox stopped responding and {failed_attempts} attempts to reconnect failed"
+            )));
+        }
+
+        eprintln!(
+            "iso2god-next-gui: upload interrupted ({error:#}); reconnecting \
+             (attempt {failed_attempts} of {})",
+            policy.max_failed_attempts
+        );
+        wait_to_retry(
+            policy,
+            failed_attempts,
+            cancel,
+            &session,
+            &files,
+            total,
+            &mut on_progress,
+        )?;
+    }
+}
+
+/// Sleeps before the next attempt, telling the window why nothing is moving.
+fn wait_to_retry<F>(
+    policy: RetryPolicy,
+    failed_attempts: u32,
+    cancel: &CancelToken,
+    session: &Session,
+    files: &[PackageFile],
+    total: u64,
+    on_progress: &mut F,
+) -> Result<(), Error>
+where
+    F: FnMut(UploadProgress),
+{
+    let delay = policy
+        .first_delay
+        .saturating_mul(1 << (failed_attempts - 1).min(16))
+        .min(policy.max_delay);
+    let deadline = Instant::now() + delay;
+    let mut last_notice = None;
+
+    loop {
+        if cancel.is_cancelled() {
+            bail!(Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+
+        let seconds = remaining.as_secs() + 1;
+        if last_notice != Some(seconds) {
+            last_notice = Some(seconds);
+            on_progress(session.progress(
+                files,
+                total,
+                None,
+                Some(format!(
+                    "The Xbox stopped responding · reconnecting in {seconds}s \
+                     (attempt {} of {})",
+                    failed_attempts + 1,
+                    policy.max_failed_attempts
+                )),
+            ));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+/// Where a retried file should restart. Returns how many bytes the console
+/// already holds (to resume after), the whole size when it has everything, or
+/// 0 to send the file again from the start.
+fn resume_point(ftp: &mut FtpStream, name: &str, sent: u64) -> u64 {
+    match ftp.size(name) {
+        Ok(remote) if remote > 0 && remote as u64 <= sent => remote as u64,
+        _ => 0,
+    }
+}
+
+/// Opens the data connection for `name`, resuming at `start` when the server
+/// allows it. Returns the stream and the offset the transfer really starts at.
+fn open_upload<T: TlsStream>(
+    ftp: &mut ImplFtpStream<T>,
+    name: &str,
+    start: u64,
+) -> Result<(TransferStream<T>, u64), Error> {
+    if start > 0 {
+        let _ = ftp.resume_transfer(start as usize);
+        match ftp.put_with_stream(name) {
+            Ok(stream) => return Ok((stream, start)),
+            Err(FtpError::UnexpectedResponse(_)) => {
+                // The server refused REST; start the file over instead.
+                let _ = ftp.resume_transfer(0);
+            }
+            Err(error) => return Err(error).with_context(|| format!("cannot create {name}")),
+        }
+    }
+
+    let stream = ftp
+        .put_with_stream(name)
+        .with_context(|| format!("cannot create {name} on the Xbox"))?;
+    Ok((stream, 0))
+}
+
+/// One connection's worth of uploading, starting from `session`.
+fn upload_attempt<F>(
+    settings: &FtpSettings,
+    files: &[PackageFile],
+    remote_relative: &Path,
+    total: u64,
+    cancel: &CancelToken,
+    session: &mut Session,
+    on_progress: &mut F,
+) -> Result<(), Failure>
+where
+    F: FnMut(UploadProgress),
+{
+    let mut ftp = connect(settings).map_err(|error| session.setup_failure(error))?;
+
+    // Find how this server spells the content folder and create whatever is
+    // missing; the package goes in below it.
+    let setup = (|| -> Result<String, Error> {
         ftp.login(settings.username.as_str(), settings.password.as_str())
             .with_context(|| format!("the Xbox rejected user '{}'", settings.username))?;
         ftp.transfer_type(FileType::Binary)
             .context("the Xbox does not accept binary transfers")?;
-
-        // Find how this server spells the content folder, create whatever is
-        // missing, then upload the package below it.
         let content_root = resolve_remote_dir(&mut ftp, settings.remote_dir())?;
-        let content_root = ensure_remote_dir(&mut ftp, content_root)?;
+        ensure_remote_dir(&mut ftp, content_root)
+    })();
+    let content_root = match setup {
+        Ok(content_root) => content_root,
+        Err(error) => return Err(session.setup_failure(error)),
+    };
+    session.connected = true;
 
-        let mut done = 0u64;
-        let mut meter = SpeedMeter::new(Instant::now());
-        let mut bytes_per_sec = None;
-        for (index, file) in files.iter().enumerate() {
-            if cancel.is_cancelled() {
-                bail!(Cancelled);
-            }
+    let result = send_files(
+        &mut ftp,
+        &content_root,
+        files,
+        remote_relative,
+        total,
+        cancel,
+        session,
+        on_progress,
+    );
 
-            let relative_dir = file.relative.parent().unwrap_or(Path::new(""));
-            let relative_to_root = remote_relative.join(relative_dir);
-            let remote_dir = remote_path(&content_root, &relative_to_root);
-            let depth = enter_relative_dir(&mut ftp, &relative_to_root)
-                .with_context(|| format!("cannot create {remote_dir} on the Xbox"))?;
-            let remote_name = file
-                .relative
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("the package contains a file name that is not valid UTF-8")?;
+    // A broken connection would make QUIT wait out the timeout for nothing.
+    if result.is_ok() {
+        let _ = ftp.quit();
+    }
+    result
+}
 
-            on_progress(UploadProgress {
-                done,
-                total,
-                files_done: index,
-                files_total,
-                file: remote_name.to_owned(),
-                bytes_per_sec,
-            });
+#[allow(clippy::too_many_arguments)]
+fn send_files<F>(
+    ftp: &mut FtpStream,
+    content_root: &str,
+    files: &[PackageFile],
+    remote_relative: &Path,
+    total: u64,
+    cancel: &CancelToken,
+    session: &mut Session,
+    on_progress: &mut F,
+) -> Result<(), Failure>
+where
+    F: FnMut(UploadProgress),
+{
+    let mut meter: Option<SpeedMeter> = None;
+    let mut bytes_per_sec = None;
 
+    while session.file < files.len() {
+        let index = session.file;
+        let file = &files[index];
+
+        if cancel.is_cancelled() {
+            return Err(Failure::Fatal(Cancelled.into()));
+        }
+
+        let relative_dir = file.relative.parent().unwrap_or(Path::new(""));
+        let relative_to_root = remote_relative.join(relative_dir);
+        let remote_dir = remote_path(content_root, &relative_to_root);
+        let depth = enter_relative_dir(ftp, &relative_to_root)
+            .with_context(|| format!("cannot create {remote_dir} on the Xbox"))?;
+        let remote_name = file
+            .relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("the package contains a file name that is not valid UTF-8")
+            .map_err(Failure::Fatal)?;
+
+        // A file that was interrupted halfway: see how much of it arrived.
+        if session.sent > 0 {
+            session.sent = if session.resume_allowed {
+                resume_point(ftp, remote_name, session.sent)
+            } else {
+                0
+            };
+        }
+        on_progress(session.progress(files, total, bytes_per_sec, None));
+
+        if session.sent < file.size || file.size == 0 {
             let mut source = File::open(&file.local)
-                .with_context(|| format!("cannot open {}", file.local.display()))?;
-            let mut remote = ftp
-                .put_with_stream(remote_name)
-                .with_context(|| format!("cannot create {remote_name} on the Xbox"))?;
+                .with_context(|| format!("cannot open {}", file.local.display()))
+                .map_err(Failure::Fatal)?;
+
+            // Kept to cut the wait short when the transfer has to be dropped.
+            let control = ftp.get_ref().try_clone().ok();
+            let (mut remote, start) = open_upload(ftp, remote_name, session.sent)?;
+            session.sent = start;
+            source
+                .seek(SeekFrom::Start(start))
+                .with_context(|| format!("cannot read {}", file.local.display()))
+                .map_err(Failure::Fatal)?;
             let _ = remote
                 .get_ref()
                 .get_ref()
-                .set_write_timeout(Some(IO_TIMEOUT));
+                .set_write_timeout(Some(STALL_TIMEOUT));
+
+            let give_up = |remote| {
+                // Dropping the stream waits for the console's reply on the
+                // control connection; do not wait a minute for a dead console.
+                if let Some(control) = &control {
+                    let _ = control.set_read_timeout(Some(ABORT_TIMEOUT));
+                }
+                drop(remote);
+            };
 
             let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
             loop {
                 if cancel.is_cancelled() {
-                    // Dropping the stream finalizes (aborts) the transfer before
-                    // the control connection is reused.
-                    drop(remote);
-                    bail!(Cancelled);
+                    give_up(remote);
+                    return Err(Failure::Fatal(Cancelled.into()));
                 }
 
                 let read = source
                     .read(&mut buffer)
-                    .with_context(|| format!("cannot read {}", file.local.display()))?;
+                    .with_context(|| format!("cannot read {}", file.local.display()))
+                    .map_err(Failure::Fatal)?;
                 if read == 0 {
                     break;
                 }
 
-                remote
-                    .write_all(&buffer[..read])
-                    .with_context(|| format!("error uploading {remote_name}"))?;
-                done += read as u64;
-                bytes_per_sec = meter.record(Instant::now(), done);
+                let done_before = session.done(files);
+                if let Err(error) = remote.write_all(&buffer[..read]) {
+                    give_up(remote);
+                    return Err(Failure::Retry(
+                        Error::new(error).context(format!("error uploading {remote_name}")),
+                    ));
+                }
+                session.sent += read as u64;
 
-                on_progress(UploadProgress {
-                    done,
-                    total,
-                    files_done: index,
-                    files_total,
-                    file: remote_name.to_owned(),
-                    bytes_per_sec,
-                });
+                bytes_per_sec = meter
+                    .get_or_insert_with(|| SpeedMeter::new(Instant::now(), done_before))
+                    .record(Instant::now(), session.done(files));
+                on_progress(session.progress(files, total, bytes_per_sec, None));
             }
 
             remote
                 .finish()
                 .with_context(|| format!("the Xbox did not finish receiving {remote_name}"))?;
 
-            // Return to the content folder so the next file starts from the
-            // same place even when the server only accepts relative paths.
-            for _ in 0..depth {
-                ftp.cdup()
-                    .context("cannot return to the content folder on the Xbox")?;
+            // A resumed file is only trusted if the console now holds exactly
+            // what we have: a server that ignores REST would have started the
+            // file over and left a corrupt one behind.
+            if start > 0 && !matches!(ftp.size(remote_name), Ok(size) if size as u64 == file.size) {
+                session.sent = 0;
+                session.resume_allowed = false;
+                return Err(Failure::Retry(anyhow::anyhow!(
+                    "the Xbox did not resume {remote_name} correctly; sending it again"
+                )));
             }
         }
 
-        on_progress(UploadProgress {
-            done: total,
-            total,
-            files_done: files_total,
-            files_total,
-            file: String::new(),
-            bytes_per_sec,
-        });
+        // Return to the content folder so the next file starts from the
+        // same place even when the server only accepts relative paths.
+        for _ in 0..depth {
+            ftp.cdup()
+                .context("cannot return to the content folder on the Xbox")?;
+        }
 
-        Ok(())
-    })();
+        session.file += 1;
+        session.sent = 0;
+    }
 
-    let _ = ftp.quit();
-    result
+    on_progress(UploadProgress {
+        done: total,
+        total,
+        files_done: files.len(),
+        files_total: files.len(),
+        file: String::new(),
+        bytes_per_sec,
+        notice: None,
+    });
+
+    Ok(())
 }
 
 /// Walks down from the resolved content folder, creating the package folders,
@@ -535,6 +874,7 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -546,17 +886,52 @@ mod tests {
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     }
 
+    /// How the mock reacts to `REST` before a `STOR`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum RestMode {
+        /// Keeps the first `offset` bytes and appends the rest.
+        Honor,
+        /// Answers 502, like a server without resume support.
+        Refuse,
+        /// Accepts the command but overwrites the file from the start.
+        Ignore,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Behavior {
+        /// Cuts the first upload dead (data and control connection) after this
+        /// many bytes, the way a stalled console looks to the client.
+        drop_first_store_after: Option<usize>,
+        rest: RestMode,
+    }
+
+    const WELL_BEHAVED: Behavior = Behavior {
+        drop_first_store_after: None,
+        rest: RestMode::Honor,
+    };
+
     fn start_server() -> MockServer {
+        start_server_with(WELL_BEHAVED)
+    }
+
+    fn start_server_with(behavior: Behavior) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let files = Arc::new(Mutex::new(HashMap::new()));
 
+        let stores = Arc::new(AtomicUsize::new(0));
+
         let thread_commands = Arc::clone(&commands);
         let thread_files = Arc::clone(&files);
         std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            serve(stream, thread_commands, thread_files);
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let commands = Arc::clone(&thread_commands);
+                let files = Arc::clone(&thread_files);
+                let stores = Arc::clone(&stores);
+                std::thread::spawn(move || serve(stream, commands, files, stores, behavior));
+            }
         });
 
         MockServer {
@@ -570,7 +945,10 @@ mod tests {
         stream: TcpStream,
         commands: Arc<Mutex<Vec<String>>>,
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        stores: Arc<AtomicUsize>,
+        behavior: Behavior,
     ) {
+        let mut rest_offset = 0usize;
         let mut writer = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream);
         let mut cwd = String::new();
@@ -624,17 +1002,65 @@ mod tests {
                     writer.write_all(reply.as_bytes()).unwrap();
                     continue;
                 }
-                "STOR" => {
-                    writer.write_all(b"150 send it\r\n").unwrap();
-                    let (mut data, _) = data_listener.take().unwrap().accept().unwrap();
-                    let mut contents = Vec::new();
-                    data.read_to_end(&mut contents).unwrap();
+                "SIZE" => {
                     let key = if cwd.is_empty() {
                         argument.to_owned()
                     } else {
                         format!("{cwd}\\{argument}")
                     };
-                    files.lock().unwrap().insert(key, contents);
+                    let size = files.lock().unwrap().get(&key).map(Vec::len);
+                    match size {
+                        Some(size) => {
+                            writer
+                                .write_all(format!("213 {size}\r\n").as_bytes())
+                                .unwrap();
+                            continue;
+                        }
+                        None => "550 no such file\r\n",
+                    }
+                }
+                "REST" => {
+                    if behavior.rest == RestMode::Refuse {
+                        "502 not implemented\r\n"
+                    } else {
+                        rest_offset = argument.parse().unwrap();
+                        "350 restarting\r\n"
+                    }
+                }
+                "STOR" => {
+                    writer.write_all(b"150 send it\r\n").unwrap();
+                    let (data, _) = data_listener.take().unwrap().accept().unwrap();
+                    let key = if cwd.is_empty() {
+                        argument.to_owned()
+                    } else {
+                        format!("{cwd}\\{argument}")
+                    };
+
+                    let first_store =
+                        argument.starts_with("Data") && stores.fetch_add(1, Ordering::SeqCst) == 0;
+                    let limit = behavior.drop_first_store_after.filter(|_| first_store);
+                    let mut contents = Vec::new();
+                    data.take(limit.unwrap_or(usize::MAX) as u64)
+                        .read_to_end(&mut contents)
+                        .unwrap();
+
+                    let mut files = files.lock().unwrap();
+                    let mut stored = match behavior.rest {
+                        RestMode::Honor => {
+                            let mut kept = files.get(&key).cloned().unwrap_or_default();
+                            kept.truncate(rest_offset);
+                            kept
+                        }
+                        _ => Vec::new(),
+                    };
+                    rest_offset = 0;
+                    stored.extend_from_slice(&contents);
+                    files.insert(key, stored);
+
+                    if limit.is_some() {
+                        // Vanish without a word.
+                        return;
+                    }
                     "226 done\r\n"
                 }
                 "QUIT" => {
@@ -683,7 +1109,7 @@ mod tests {
     #[test]
     fn speed_meter_waits_for_a_full_window_then_smooths() {
         let start = Instant::now();
-        let mut meter = SpeedMeter::new(start);
+        let mut meter = SpeedMeter::new(start, 0);
 
         assert_eq!(
             meter.record(start + Duration::from_millis(100), 1 << 20),
@@ -701,6 +1127,183 @@ mod tests {
             .record(start + Duration::from_secs(2), 1 << 20)
             .unwrap();
         assert!(second > 0.0 && second < first);
+    }
+
+    fn package_with_big_file(name: &str, size: usize) -> (PathBuf, PathBuf, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!(
+            "iso2god-next-ftp-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let package = root.join("ABCD1234").join("00007000");
+        fs::create_dir_all(package.join("01020304.data")).unwrap();
+        fs::write(package.join("01020304"), b"con header").unwrap();
+        let data: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+        fs::write(package.join("01020304.data").join("Data0000"), &data).unwrap();
+        (root, package, data)
+    }
+
+    fn mock_settings(server: &MockServer) -> FtpSettings {
+        FtpSettings {
+            enabled: true,
+            host: format!("127.0.0.1:{}", server.port),
+            username: "xboxftp".to_owned(),
+            password: "xboxftp".to_owned(),
+            remote_dir: crate::settings::DEFAULT_REMOTE_DIR.to_owned(),
+        }
+    }
+
+    const FAST_RETRIES: RetryPolicy = RetryPolicy {
+        max_failed_attempts: 4,
+        first_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(20),
+    };
+
+    /// Uploads a package whose big file is cut off partway and returns what the
+    /// console ended up holding, plus the progress notices that were shown.
+    fn upload_through_a_stall(rest: RestMode) -> (Vec<u8>, Vec<u8>, Vec<String>, Vec<String>) {
+        let (root, package, data) = package_with_big_file(
+            match rest {
+                RestMode::Honor => "honor",
+                RestMode::Refuse => "refuse",
+                RestMode::Ignore => "ignore",
+            },
+            900_000,
+        );
+        let server = start_server_with(Behavior {
+            drop_first_store_after: Some(300_000),
+            rest,
+        });
+        let relative = Path::new("ABCD1234").join("00007000");
+        let remote_dir = remote_path(crate::settings::DEFAULT_REMOTE_DIR, &relative);
+
+        let mut notices = Vec::new();
+        upload_package_with(
+            FAST_RETRIES,
+            &mock_settings(&server),
+            &package,
+            &relative,
+            &CancelToken::new(),
+            |progress| {
+                if let Some(notice) = progress.notice {
+                    notices.push(notice);
+                }
+            },
+        )
+        .unwrap();
+
+        let files = server.files.lock().unwrap();
+        let header = files[&format!("{remote_dir}\\01020304")].clone();
+        let uploaded = files[&format!("{remote_dir}\\01020304.data\\Data0000")].clone();
+        let commands = server.commands.lock().unwrap().clone();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(header, b"con header");
+        (uploaded, data, notices, commands)
+    }
+
+    #[test]
+    fn a_stalled_upload_reconnects_and_resumes_the_file() {
+        let (uploaded, data, notices, commands) = upload_through_a_stall(RestMode::Honor);
+
+        assert!(
+            uploaded == data,
+            "the resumed file differs from the original"
+        );
+        assert!(!notices.is_empty(), "the stall was not reported");
+        assert!(commands.iter().any(|command| command.starts_with("REST ")));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.starts_with("STOR "))
+                .count(),
+            3,
+            "header, the cut-off file and its resumed remainder"
+        );
+    }
+
+    #[test]
+    fn a_server_without_resume_gets_the_file_again_from_the_start() {
+        let (uploaded, data, notices, _) = upload_through_a_stall(RestMode::Refuse);
+
+        assert!(uploaded == data);
+        assert!(!notices.is_empty());
+    }
+
+    #[test]
+    fn a_server_that_ignores_resume_does_not_end_up_with_a_corrupt_file() {
+        let (uploaded, data, _, commands) = upload_through_a_stall(RestMode::Ignore);
+
+        assert!(uploaded == data, "the file was left corrupt");
+        // Resumed once, found the wrong size, then sent the whole file again.
+        assert!(commands.iter().any(|command| command.starts_with("REST ")));
+    }
+
+    #[test]
+    fn a_wrong_address_fails_at_once_instead_of_retrying() {
+        let (root, package, _) = package_with_big_file("unreachable", 1000);
+        // Nothing listens on this port.
+        let unused = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = unused.local_addr().unwrap().port();
+        drop(unused);
+
+        let settings = FtpSettings {
+            enabled: true,
+            host: format!("127.0.0.1:{port}"),
+            username: "xboxftp".to_owned(),
+            password: "xboxftp".to_owned(),
+            remote_dir: crate::settings::DEFAULT_REMOTE_DIR.to_owned(),
+        };
+
+        let started = Instant::now();
+        let error = upload_package_with(
+            RetryPolicy {
+                max_failed_attempts: 5,
+                first_delay: Duration::from_secs(30),
+                max_delay: Duration::from_secs(30),
+            },
+            &settings,
+            &package,
+            Path::new("ABCD1234/00007000"),
+            &CancelToken::new(),
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(format!("{error:#}").contains("cannot connect"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cancelling_while_waiting_to_reconnect_stops_the_upload() {
+        let (root, package, _) = package_with_big_file("cancel", 400_000);
+        let server = start_server_with(Behavior {
+            drop_first_store_after: Some(100_000),
+            rest: RestMode::Honor,
+        });
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+
+        let error = upload_package_with(
+            RetryPolicy {
+                max_failed_attempts: 4,
+                first_delay: Duration::from_secs(30),
+                max_delay: Duration::from_secs(30),
+            },
+            &mock_settings(&server),
+            &package,
+            Path::new("ABCD1234/00007000"),
+            &cancel,
+            |progress| {
+                if progress.notice.is_some() {
+                    canceller.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.is::<Cancelled>());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

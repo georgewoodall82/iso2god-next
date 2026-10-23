@@ -470,6 +470,20 @@ where
 
     loop {
         let done_before = session.done(&files);
+        if failed_attempts > 0 {
+            // Keep the notice on screen while connecting, which can take a
+            // while when the console is still not answering.
+            on_progress(session.progress(
+                &files,
+                total,
+                None,
+                Some(format!(
+                    "Reconnecting to the Xbox… (attempt {} of {})",
+                    failed_attempts + 1,
+                    policy.max_failed_attempts
+                )),
+            ));
+        }
         let error = match upload_attempt(
             settings,
             &files,
@@ -552,7 +566,7 @@ where
                 total,
                 None,
                 Some(format!(
-                    "The Xbox stopped responding · reconnecting in {seconds}s \
+                    "The Xbox stopped responding · retrying in {seconds}s \
                      (attempt {} of {})",
                     failed_attempts + 1,
                     policy.max_failed_attempts

@@ -130,6 +130,7 @@ fn upload_if_enabled(
 
     let mut last_marker = u64::MAX;
     let mut last_sent = std::time::Instant::now();
+    let mut last_notice: Option<String> = None;
     let progress_sender = sender.clone();
     let progress_path = job.path.clone();
 
@@ -139,8 +140,11 @@ fn upload_if_enabled(
         let marker =
             (progress.fraction() * 1000.0).round() as u64 + progress.files_done as u64 * 100_000;
         let stale = last_sent.elapsed() >= std::time::Duration::from_millis(500);
-        if marker != last_marker || stale {
+        // A changed notice (the retry countdown) is always shown straight away.
+        let notice_changed = progress.notice != last_notice;
+        if marker != last_marker || stale || notice_changed {
             last_marker = marker;
+            last_notice.clone_from(&progress.notice);
             last_sent = std::time::Instant::now();
             progress_sender.input(AppMsg::UploadProgress(progress_path.clone(), progress));
         }

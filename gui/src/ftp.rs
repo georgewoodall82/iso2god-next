@@ -333,6 +333,8 @@ struct Session {
     file: usize,
     /// Bytes of that file already written to the console.
     sent: u64,
+    /// Whether anything may already have been created on the console.
+    touched: bool,
     /// Whether any connection has got as far as the content folder. Until then a
     /// failure is a configuration problem (wrong address, wrong password), not a
     /// stall, and is reported at once instead of retried.
@@ -464,17 +466,63 @@ where
         file: 0,
         sent: 0,
         connected: false,
+        touched: false,
         resume_allowed: true,
     };
+
+    let result = upload_with_retries(
+        policy,
+        settings,
+        &files,
+        remote_relative,
+        total,
+        cancel,
+        &mut session,
+        &mut on_progress,
+    );
+
+    // Cancelling an upload that already put something on the console takes the
+    // partial package off again.
+    match result {
+        Err(error) if error.is::<Cancelled>() && session.touched => {
+            on_progress(session.progress(
+                &files,
+                total,
+                None,
+                Some("Cancelled · removing the partial upload from the Xbox…".to_owned()),
+            ));
+            if let Err(cleanup) = remove_partial_package(settings, &files, remote_relative) {
+                eprintln!("iso2god-next-gui: could not remove the partial upload: {cleanup:#}");
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_with_retries<F>(
+    policy: RetryPolicy,
+    settings: &FtpSettings,
+    files: &[PackageFile],
+    remote_relative: &Path,
+    total: u64,
+    cancel: &CancelToken,
+    session: &mut Session,
+    on_progress: &mut F,
+) -> Result<(), Error>
+where
+    F: FnMut(UploadProgress),
+{
     let mut failed_attempts = 0u32;
 
     loop {
-        let done_before = session.done(&files);
+        let done_before = session.done(files);
         if failed_attempts > 0 {
             // Keep the notice on screen while connecting, which can take a
             // while when the console is still not answering.
             on_progress(session.progress(
-                &files,
+                files,
                 total,
                 None,
                 Some(format!(
@@ -486,12 +534,12 @@ where
         }
         let error = match upload_attempt(
             settings,
-            &files,
+            files,
             remote_relative,
             total,
             cancel,
-            &mut session,
-            &mut on_progress,
+            session,
+            on_progress,
         ) {
             Ok(()) => return Ok(()),
             Err(Failure::Fatal(error)) => return Err(error),
@@ -502,7 +550,7 @@ where
             return Err(Cancelled.into());
         }
 
-        if session.done(&files) > done_before {
+        if session.done(files) > done_before {
             failed_attempts = 0;
         }
         failed_attempts += 1;
@@ -521,10 +569,10 @@ where
             policy,
             failed_attempts,
             cancel,
-            &session,
-            &files,
+            session,
+            files,
             total,
-            &mut on_progress,
+            on_progress,
         )?;
     }
 }
@@ -689,6 +737,7 @@ where
         let relative_dir = file.relative.parent().unwrap_or(Path::new(""));
         let relative_to_root = remote_relative.join(relative_dir);
         let remote_dir = remote_path(content_root, &relative_to_root);
+        session.touched = true;
         let depth = enter_relative_dir(ftp, &relative_to_root)
             .with_context(|| format!("cannot create {remote_dir} on the Xbox"))?;
         let remote_name = file
@@ -802,6 +851,130 @@ where
         notice: None,
     });
 
+    Ok(())
+}
+
+/// How long the cleanup after a cancel waits for each reply from the console.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Enters folders below the current one without creating any. Returns how many
+/// levels were entered, or `None` (back where it started) if one is missing.
+fn enter_existing(ftp: &mut FtpStream, relative: &Path) -> Option<usize> {
+    let mut depth = 0;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let entered = name.to_str().is_some_and(|name| ftp.cwd(name).is_ok());
+        if !entered {
+            for _ in 0..depth {
+                let _ = ftp.cdup();
+            }
+            return None;
+        }
+        depth += 1;
+    }
+    Some(depth)
+}
+
+fn go_up(ftp: &mut FtpStream, depth: usize) -> Result<(), Error> {
+    for _ in 0..depth {
+        ftp.cdup()
+            .context("cannot return to the content folder on the Xbox")?;
+    }
+    Ok(())
+}
+
+/// Removes the folder `relative` (below the current folder), if it exists.
+fn remove_dir(ftp: &mut FtpStream, relative: &Path) -> Result<(), Error> {
+    let (Some(parent), Some(name)) = (
+        relative.parent(),
+        relative.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Ok(());
+    };
+    if let Some(depth) = enter_existing(ftp, parent) {
+        let _ = ftp.rmdir(name);
+        go_up(ftp, depth)?;
+    }
+    Ok(())
+}
+
+/// Removes the folder `relative` only when the console lists nothing in it.
+/// When the listing fails the folder is left alone: something else may live
+/// in it and not every server refuses to delete a folder that is not empty.
+fn remove_dir_if_empty(ftp: &mut FtpStream, relative: &Path) -> Result<(), Error> {
+    let Some(depth) = enter_existing(ftp, relative) else {
+        return Ok(());
+    };
+    let listing = ftp.nlst(None);
+    go_up(ftp, depth)?;
+
+    let empty = listing.is_ok_and(|names| {
+        names.iter().all(|name| {
+            let name = name.trim().trim_end_matches(['/', '\\']);
+            let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
+            matches!(leaf, "" | "." | "..")
+        })
+    });
+    if empty {
+        remove_dir(ftp, relative)?;
+    }
+    Ok(())
+}
+
+/// Best-effort removal of a package that was only partly uploaded: deletes the
+/// package's files, then its folders, leaving anything else (other content for
+/// the same title) in place.
+fn remove_partial_package(
+    settings: &FtpSettings,
+    files: &[PackageFile],
+    remote_relative: &Path,
+) -> Result<(), Error> {
+    let mut ftp = connect(settings)?;
+    let _ = ftp.get_ref().set_read_timeout(Some(CLEANUP_TIMEOUT));
+    let _ = ftp.get_ref().set_write_timeout(Some(CLEANUP_TIMEOUT));
+
+    ftp.login(settings.username.as_str(), settings.password.as_str())
+        .with_context(|| format!("the Xbox rejected user '{}'", settings.username))?;
+    let content_root = resolve_remote_dir(&mut ftp, settings.remote_dir())?;
+    if !content_root.missing.is_empty() {
+        // The content folder does not even exist, so nothing was uploaded.
+        return Ok(());
+    }
+
+    for file in files {
+        let Some(name) = file.relative.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let dir = remote_relative.join(file.relative.parent().unwrap_or(Path::new("")));
+        if let Some(depth) = enter_existing(&mut ftp, &dir) {
+            let _ = ftp.rm(name);
+            go_up(&mut ftp, depth)?;
+        }
+    }
+
+    // The package's own subfolders (the .data folder), deepest first.
+    let mut folders: Vec<PathBuf> = files
+        .iter()
+        .filter_map(|file| file.relative.parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| remote_relative.join(parent))
+        .collect();
+    folders.sort();
+    folders.dedup();
+    folders.sort_by_key(|folder| std::cmp::Reverse(folder.components().count()));
+    for folder in &folders {
+        remove_dir(&mut ftp, folder)?;
+    }
+
+    // The <TitleID>/<ContentType> folders go too, unless they hold other things.
+    remove_dir_if_empty(&mut ftp, remote_relative)?;
+    if let Some(title_dir) = remote_relative.parent() {
+        remove_dir_if_empty(&mut ftp, title_dir)?;
+    }
+
+    let _ = ftp.quit();
     Ok(())
 }
 
@@ -1004,6 +1177,38 @@ mod tests {
                     "250 directory changed\r\n"
                 }
                 "MKD" => "257 created\r\n",
+                "RMD" => "250 removed\r\n",
+                "DELE" => {
+                    let key = if cwd.is_empty() {
+                        argument.to_owned()
+                    } else {
+                        format!("{cwd}\\{argument}")
+                    };
+                    if files.lock().unwrap().remove(&key).is_some() {
+                        "250 deleted\r\n"
+                    } else {
+                        "550 no such file\r\n"
+                    }
+                }
+                "NLST" => {
+                    writer.write_all(b"150 listing\r\n").unwrap();
+                    let (mut data, _) = data_listener.take().unwrap().accept().unwrap();
+                    let prefix = format!("{cwd}\\");
+                    let mut names: Vec<String> = files
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .filter_map(|key| key.strip_prefix(&prefix))
+                        .map(|rest| rest.split('\\').next().unwrap().to_owned())
+                        .collect();
+                    names.sort();
+                    names.dedup();
+                    for name in names {
+                        data.write_all(format!("{name}\r\n").as_bytes()).unwrap();
+                    }
+                    drop(data);
+                    "226 done\r\n"
+                }
                 "PASV" => {
                     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                     let port = listener.local_addr().unwrap().port();
@@ -1318,6 +1523,87 @@ mod tests {
 
         assert!(error.is::<Cancelled>());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Cancels an upload once `cancel_after` bytes are through and returns the
+    /// server's view of what is left, plus the commands it saw.
+    fn cancel_an_upload(keep_foreign_file: bool) -> (Vec<String>, Vec<String>) {
+        let (root, package, _) = package_with_big_file(
+            if keep_foreign_file {
+                "cancel-keep"
+            } else {
+                "cancel-clean"
+            },
+            900_000,
+        );
+        let server = start_server();
+        let relative = Path::new("ABCD1234").join("00007000");
+        let remote_dir = remote_path(crate::settings::DEFAULT_REMOTE_DIR, &relative);
+        if keep_foreign_file {
+            server
+                .files
+                .lock()
+                .unwrap()
+                .insert(format!("{remote_dir}\\KEEP.ME"), b"not ours".to_vec());
+        }
+
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+        let mut notices = Vec::new();
+        let error = upload_package_with(
+            FAST_RETRIES,
+            &mock_settings(&server),
+            &package,
+            &relative,
+            &cancel,
+            |progress| {
+                if progress.done > 300_000 {
+                    canceller.cancel();
+                }
+                if let Some(notice) = progress.notice {
+                    notices.push(notice);
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.is::<Cancelled>());
+        assert!(notices.iter().any(|notice| notice.contains("removing")));
+
+        let mut left: Vec<String> = server.files.lock().unwrap().keys().cloned().collect();
+        left.sort();
+        let commands = server.commands.lock().unwrap().clone();
+        fs::remove_dir_all(&root).unwrap();
+        (left, commands)
+    }
+
+    #[test]
+    fn cancelling_an_upload_removes_the_partial_package_from_the_console() {
+        let (left, commands) = cancel_an_upload(false);
+
+        assert!(left.is_empty(), "left behind: {left:?}");
+        assert!(commands.iter().any(|command| command == "DELE Data0000"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "RMD 01020304.data")
+        );
+        assert!(commands.iter().any(|command| command == "RMD 00007000"));
+        assert!(commands.iter().any(|command| command == "RMD ABCD1234"));
+    }
+
+    #[test]
+    fn cancelling_leaves_other_files_in_the_package_folder_alone() {
+        let (left, commands) = cancel_an_upload(true);
+
+        assert_eq!(left.len(), 1);
+        assert!(left[0].ends_with("KEEP.ME"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "RMD 01020304.data")
+        );
+        assert!(!commands.iter().any(|command| command == "RMD 00007000"));
+        assert!(!commands.iter().any(|command| command == "RMD ABCD1234"));
     }
 
     #[test]

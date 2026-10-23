@@ -18,6 +18,11 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+/// Formats a transfer rate, e.g. `2.3 MiB/s`.
+pub fn speed(bytes_per_sec: f64) -> String {
+    format!("{}/s", size(bytes_per_sec.max(0.0) as u64))
+}
+
 /// Rounds a `0.0..=1.0` fraction to a whole percentage.
 pub fn percent(fraction: f64) -> u32 {
     (fraction.clamp(0.0, 1.0) * 100.0).round() as u32

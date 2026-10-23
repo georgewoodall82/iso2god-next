@@ -121,17 +121,23 @@ fn subtitle(entry: &IsoEntry) -> String {
                 "Connecting to the Xbox…".to_owned()
             } else if progress.files_done >= progress.files_total {
                 "Uploaded to the Xbox".to_owned()
-            } else if progress.file.is_empty() {
-                format!(
-                    "Uploading to the Xbox · {}%",
-                    format::percent(progress.fraction())
-                )
             } else {
-                format!(
-                    "Uploading {} · {}%",
-                    progress.file,
-                    format::percent(progress.fraction())
-                )
+                let mut text = if progress.file.is_empty() {
+                    format!(
+                        "Uploading to the Xbox · {}%",
+                        format::percent(progress.fraction())
+                    )
+                } else {
+                    format!(
+                        "Uploading {} · {}%",
+                        progress.file,
+                        format::percent(progress.fraction())
+                    )
+                };
+                if let Some(rate) = progress.bytes_per_sec {
+                    text.push_str(&format!(" · {}", format::speed(rate)));
+                }
+                text
             }
         }
         EntryState::Done { uploaded: true } => "Converted · uploaded to the Xbox".to_owned(),

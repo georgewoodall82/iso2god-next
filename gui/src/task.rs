@@ -129,15 +129,19 @@ fn upload_if_enabled(
     let relative = job.info.package_relative_path();
 
     let mut last_marker = u64::MAX;
+    let mut last_sent = std::time::Instant::now();
     let progress_sender = sender.clone();
     let progress_path = job.path.clone();
 
     let result = ftp::upload_package(settings, &package_dir, &relative, cancel, |progress| {
-        // Report at most once per tenth of a percent (and once per file).
+        // Report at most once per tenth of a percent (and once per file), plus
+        // twice a second so the speed readout keeps moving on a slow link.
         let marker =
             (progress.fraction() * 1000.0).round() as u64 + progress.files_done as u64 * 100_000;
-        if marker != last_marker {
+        let stale = last_sent.elapsed() >= std::time::Duration::from_millis(500);
+        if marker != last_marker || stale {
             last_marker = marker;
+            last_sent = std::time::Instant::now();
             progress_sender.input(AppMsg::UploadProgress(progress_path.clone(), progress));
         }
     });

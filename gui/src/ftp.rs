@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Error, bail};
 use iso2god_next::{CancelToken, Cancelled};
@@ -37,6 +37,8 @@ pub struct UploadProgress {
     pub files_total: usize,
     /// File currently being sent, for the row subtitle.
     pub file: String,
+    /// Smoothed upload speed, once enough time has passed to measure one.
+    pub bytes_per_sec: Option<f64>,
 }
 
 impl UploadProgress {
@@ -45,6 +47,44 @@ impl UploadProgress {
             return 0.0;
         }
         (self.done as f64 / self.total as f64).clamp(0.0, 1.0)
+    }
+}
+
+/// Measures throughput over the whole upload. Single samples are noisy (the
+/// socket buffer swallows bursts), so each half-second window is blended into a
+/// running average.
+struct SpeedMeter {
+    window_start: Instant,
+    window_done: u64,
+    rate: Option<f64>,
+}
+
+impl SpeedMeter {
+    const WINDOW: Duration = Duration::from_millis(500);
+    /// Weight of the newest window in the running average.
+    const SMOOTHING: f64 = 0.3;
+
+    fn new(now: Instant) -> Self {
+        SpeedMeter {
+            window_start: now,
+            window_done: 0,
+            rate: None,
+        }
+    }
+
+    /// Records the cumulative byte count and returns the current speed.
+    fn record(&mut self, now: Instant, done: u64) -> Option<f64> {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed >= Self::WINDOW {
+            let window_rate = done.saturating_sub(self.window_done) as f64 / elapsed.as_secs_f64();
+            self.rate = Some(match self.rate {
+                Some(rate) => rate + (window_rate - rate) * Self::SMOOTHING,
+                None => window_rate,
+            });
+            self.window_start = now;
+            self.window_done = done;
+        }
+        self.rate
     }
 }
 
@@ -315,6 +355,8 @@ where
         let content_root = ensure_remote_dir(&mut ftp, content_root)?;
 
         let mut done = 0u64;
+        let mut meter = SpeedMeter::new(Instant::now());
+        let mut bytes_per_sec = None;
         for (index, file) in files.iter().enumerate() {
             if cancel.is_cancelled() {
                 bail!(Cancelled);
@@ -337,6 +379,7 @@ where
                 files_done: index,
                 files_total,
                 file: remote_name.to_owned(),
+                bytes_per_sec,
             });
 
             let mut source = File::open(&file.local)
@@ -369,6 +412,7 @@ where
                     .write_all(&buffer[..read])
                     .with_context(|| format!("error uploading {remote_name}"))?;
                 done += read as u64;
+                bytes_per_sec = meter.record(Instant::now(), done);
 
                 on_progress(UploadProgress {
                     done,
@@ -376,6 +420,7 @@ where
                     files_done: index,
                     files_total,
                     file: remote_name.to_owned(),
+                    bytes_per_sec,
                 });
             }
 
@@ -397,6 +442,7 @@ where
             files_done: files_total,
             files_total,
             file: String::new(),
+            bytes_per_sec,
         });
 
         Ok(())
@@ -632,6 +678,29 @@ mod tests {
         assert!(commands.iter().any(|command| command == "QUIT"));
         assert!(!commands.iter().any(|command| command.starts_with("STOR")));
         assert!(server.files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn speed_meter_waits_for_a_full_window_then_smooths() {
+        let start = Instant::now();
+        let mut meter = SpeedMeter::new(start);
+
+        assert_eq!(
+            meter.record(start + Duration::from_millis(100), 1 << 20),
+            None
+        );
+
+        // 1 MiB over the first full second window.
+        let first = meter
+            .record(start + Duration::from_secs(1), 1 << 20)
+            .expect("speed after a full window");
+        assert!((first - (1 << 20) as f64).abs() < 1.0);
+
+        // A stalled window pulls the average down, but not straight to zero.
+        let second = meter
+            .record(start + Duration::from_secs(2), 1 << 20)
+            .unwrap();
+        assert!(second > 0.0 && second < first);
     }
 
     #[test]

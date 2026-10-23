@@ -647,6 +647,7 @@ impl SimpleComponent for AppModel {
                         files_done: 0,
                         files_total: 0,
                         file: String::new(),
+                        bytes_per_sec: None,
                     });
                 }
             }

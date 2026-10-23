@@ -13,7 +13,7 @@
 
 - **Desktop app** built with GTK4 and libadwaita: add several ISOs or game folders at once (buttons, drag and drop, or command line), see per-game and overall progress, and cancel at any time.
 - **Game folders**: point it at a folder that contains a `default.xex` and it converts the files directly, with no need to rebuild an ISO first.
-- **FTP upload** to the console: after each conversion the finished package is copied to the Xbox 360 (Aurora, Freestyle Dash, XeXMenu and other FTP servers), with its own progress bar.
+- **FTP upload** to the console: after each conversion the finished package is copied to the Xbox 360 (Aurora, Freestyle Dash, XeXMenu and other FTP servers), with its own progress bar, the transfer speed and the time remaining. If the console stalls, the upload reconnects and carries on, resuming the file where the server allows it.
 - **Command line tool** for scripting and batch jobs.
 - **Fast**: part files are written in parallel across worker threads.
 - **Trimming**: unused space at the end of the ISO can be dropped, which usually saves several gigabytes.
@@ -22,7 +22,7 @@
 
 ## Download
 
-Grab the latest build from the [releases page](https://github.com/georgewoodall82/iso2god-next/releases). File names include the version, shown here as `<version>` (for example `v1.1.1`).
+Grab the latest build from the [releases page](https://github.com/georgewoodall82/iso2god-next/releases). File names include the version, shown here as `<version>` (for example `v1.2.0`).
 
 | Platform | File | Status |
 | -------- | ---- | ------ |
@@ -60,7 +60,7 @@ The command line tool is not part of the releases; build it from source (see [Co
 1. **Add games** with **Add ISOs** or **Add XEX Folder**, by dragging ISO files or folders into the window, or on the command line.
 2. **Choose an output folder.**
 3. **Convert.** Games are converted one after another, and a toast tells you when everything is done.
-4. **Upload (optional).** Open **Settings → FTP upload**, enter the console's IP address and use **Test connection** to check it. The username and password default to `xboxftp`. Converted games are copied to `Hdd1:\Content\0000000000000000` unless you change the content folder.
+4. **Upload (optional).** Open **Settings → FTP upload**, enter the console's IP address and use **Test connection** to check it. The username and password default to `xboxftp`. Converted games are copied to `Hdd1:\Content\0000000000000000` unless you change the content folder. Cancelling removes the game that was being converted or uploaded, so no half-finished package is left behind.
 
 | Shortcut | Action |
 | -------- | ------ |

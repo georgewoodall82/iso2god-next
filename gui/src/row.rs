@@ -125,16 +125,9 @@ fn subtitle(entry: &IsoEntry) -> String {
                 notice.clone()
             } else {
                 let mut text = if progress.file.is_empty() {
-                    format!(
-                        "Uploading to the Xbox · {}%",
-                        format::percent(progress.fraction())
-                    )
+                    "Uploading to the Xbox".to_owned()
                 } else {
-                    format!(
-                        "Uploading {} · {}%",
-                        progress.file,
-                        format::percent(progress.fraction())
-                    )
+                    format!("Uploading {}", progress.file)
                 };
                 if let Some(rate) = progress.bytes_per_sec {
                     text.push_str(&format!(" · {}", format::speed(rate)));

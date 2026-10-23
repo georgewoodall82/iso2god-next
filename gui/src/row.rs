@@ -138,6 +138,11 @@ fn subtitle(entry: &IsoEntry) -> String {
                 };
                 if let Some(rate) = progress.bytes_per_sec {
                     text.push_str(&format!(" · {}", format::speed(rate)));
+                    if rate >= 1.0 {
+                        let remaining = progress.total.saturating_sub(progress.done);
+                        let seconds = (remaining as f64 / rate).ceil() as u64;
+                        text.push_str(&format!(" · {} left", format::duration(seconds)));
+                    }
                 }
                 text
             }

@@ -365,8 +365,8 @@ where
 
 /// Same as [`convert`], but can be stopped with `cancel`.
 ///
-/// Cancelling removes the partially written data folder, but leaves anything
-/// that was already in the destination untouched.
+/// Cancelling removes the partially written package, but leaves anything else
+/// in the destination untouched.
 pub fn convert_cancellable<F>(
     options: &ConvertOptions,
     cancel: &CancelToken,
@@ -461,11 +461,11 @@ where
     });
 
     if let Err(error) = write_result {
-        discard_if_cancelled(cancel, &data_dir);
+        discard_if_cancelled(cancel, &file_layout);
         return Err(error);
     }
 
-    if discard_if_cancelled(cancel, &data_dir) {
+    if discard_if_cancelled(cancel, &file_layout) {
         bail!(Cancelled);
     }
 
@@ -479,7 +479,7 @@ where
         read_part_mht(&file_layout, part_count - 1).context("error reading the part file MHT")?;
 
     for (index, prev_part_index) in (0..part_count - 1).rev().enumerate() {
-        if discard_if_cancelled(cancel, &data_dir) {
+        if discard_if_cancelled(cancel, &file_layout) {
             bail!(Cancelled);
         }
 
@@ -550,12 +550,25 @@ where
     Ok(())
 }
 
-/// Removes the half-converted data folder if the conversion was cancelled, so
-/// a multi-gigabyte partial result isn't left behind. Returns whether it was.
-fn discard_if_cancelled(cancel: &CancelToken, data_dir: &Path) -> bool {
+/// Removes the half-converted package if the conversion was cancelled, so a
+/// multi-gigabyte partial result isn't left behind. Returns whether it was.
+///
+/// The data folder goes, and so does a header left by an earlier conversion of
+/// the same game: its data was cleared when this run started, so the header
+/// alone would describe a package that no longer exists. The `<TitleID>` and
+/// `<ContentType>` folders go only if that leaves them empty.
+fn discard_if_cancelled(cancel: &CancelToken, file_layout: &FileLayout) -> bool {
     let cancelled = cancel.is_cancelled();
     if cancelled {
-        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(file_layout.data_dir_path());
+        let _ = fs::remove_file(file_layout.con_header_file_path());
+
+        let package_dir = file_layout.package_dir_path();
+        // `remove_dir` refuses to delete anything that still has content.
+        let _ = fs::remove_dir(&package_dir);
+        if let Some(title_dir) = package_dir.parent() {
+            let _ = fs::remove_dir(title_dir);
+        }
     }
     cancelled
 }

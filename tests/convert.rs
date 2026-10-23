@@ -106,6 +106,57 @@ fn cancellation_is_reported_and_leaves_no_partial_folder() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn cancelling_halfway_removes_the_half_converted_package() {
+    let dir = temp_dir("cancel-halfway");
+    let iso_path = dir.join("Test Game.iso");
+    fs::write(
+        &iso_path,
+        build_xsf_iso(TITLE_ID, MEDIA_ID, &[0x5a_u8; 0x4000]),
+    )
+    .unwrap();
+    let info = convert::inspect(&iso_path).unwrap();
+
+    let dest_dir = dir.join("out");
+    let other_game = dest_dir.join("DEADBEEF").join("00007000");
+    fs::create_dir_all(&other_game).unwrap();
+    fs::write(other_game.join("keep"), b"another game").unwrap();
+
+    // An earlier, finished conversion of the same game is being redone.
+    let options = ConvertOptions::new(&iso_path, &dest_dir);
+    convert::convert(&options, |_| {}).unwrap();
+    assert!(info.con_header_file_path(&dest_dir).is_file());
+
+    let cancel = CancelToken::new();
+    let error = convert::convert_cancellable(&options, &cancel, |sample| {
+        if sample.stage == Stage::WritingParts && sample.done > 0 {
+            cancel.cancel();
+        }
+    })
+    .unwrap_err();
+
+    assert!(error.is::<Cancelled>(), "unexpected error: {error:#}");
+    assert!(!info.data_dir_path(&dest_dir).exists(), "data folder left");
+    assert!(
+        !info.con_header_file_path(&dest_dir).exists(),
+        "stale header left"
+    );
+    assert!(
+        !info.package_dir_path(&dest_dir).exists(),
+        "package folder left"
+    );
+    assert!(
+        !dest_dir.join("415607F7").exists(),
+        "title folder left behind"
+    );
+    assert!(
+        other_game.join("keep").is_file(),
+        "another game was touched"
+    );
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 fn iso_bytes_at(path: &Path, offset: usize, len: usize) -> Vec<u8> {
     let image = fs::read(path).unwrap();
     image[offset..offset + len].to_vec()
